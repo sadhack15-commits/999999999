@@ -17,28 +17,29 @@ pip_install([
     "requests>=2.31.0",
     "scikit-learn>=1.3.0",
     "nest_asyncio>=1.6.0",
-    "flask>=3.0.0"  # Thêm Flask cho web server
+    "flask>=3.0.0"
 ])
 
 import nest_asyncio
+import requests  # Import sớm để dùng cho Ollama install
 nest_asyncio.apply()
 
 # ---- Cài Ollama (NO SUDO - user mode) ----
 print("[ollama] Installing in user mode...")
+
 OLLAMA_DIR = Path.home() / ".ollama"
 OLLAMA_BIN = OLLAMA_DIR / "bin"
 OLLAMA_EXEC = OLLAMA_BIN / "ollama"
 
 def install_ollama_user():
-    """Cài Ollama không cần sudo"""
+    """Cài Ollama không cần sudo - Download trực tiếp binary"""
     if OLLAMA_EXEC.exists():
         print(f"✓ Ollama đã có tại: {OLLAMA_EXEC}")
         return
     
     OLLAMA_BIN.mkdir(parents=True, exist_ok=True)
     
-    # Download ollama binary
-    import platform, urllib.request
+    import platform
     system = platform.system().lower()
     arch = platform.machine().lower()
     
@@ -46,13 +47,93 @@ def install_ollama_user():
         arch = "amd64"
     elif "aarch64" in arch or "arm64" in arch:
         arch = "arm64"
+    else:
+        raise RuntimeError(f"Unsupported architecture: {arch}")
     
-    url = f"https://github.com/ollama/ollama/releases/latest/download/ollama-{system}-{arch}"
+    # URL cố định từ Ollama CDN (không redirect)
+    base_url = "https://ollama.com/download"
+    version = "0.5.14"  # Version ổn định
     
-    print(f"Downloading from: {url}")
-    urllib.request.urlretrieve(url, OLLAMA_EXEC)
-    OLLAMA_EXEC.chmod(0o755)
-    print(f"✓ Ollama installed to: {OLLAMA_EXEC}")
+    # Thử CDN trước, sau đó GitHub
+    urls_to_try = [
+        # CDN chính thức
+        f"{base_url}/ollama-{system}-{arch}",
+        # GitHub releases (versions cũ hơn nhưng stable)
+        f"https://github.com/ollama/ollama/releases/download/v{version}/ollama-{system}-{arch}",
+        f"https://github.com/ollama/ollama/releases/download/v0.5.10/ollama-{system}-{arch}",
+        f"https://github.com/ollama/ollama/releases/download/v0.5.8/ollama-{system}-{arch}",
+    ]
+    
+    last_error = None
+    for idx, url in enumerate(urls_to_try, 1):
+        try:
+            print(f"\n[{idx}/{len(urls_to_try)}] Trying: {url}")
+            
+            response = requests.get(
+                url,
+                stream=True,
+                timeout=300,
+                allow_redirects=True,
+                headers={'User-Agent': 'Mozilla/5.0'}
+            )
+            
+            if response.status_code == 404:
+                print(f"  ✗ Not found (404)")
+                continue
+            
+            if response.status_code != 200:
+                print(f"  ✗ HTTP {response.status_code}")
+                continue
+            
+            total_size = int(response.headers.get('content-length', 0))
+            if total_size == 0:
+                print(f"  ✗ Empty file or unknown size")
+                continue
+            
+            print(f"  ✓ Found! Downloading {total_size/1048576:.1f}MB...")
+            
+            downloaded = 0
+            last_print = 0
+            
+            with open(OLLAMA_EXEC, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=65536):  # 64KB chunks
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        
+                        # Print progress every 5MB
+                        if downloaded - last_print >= 5*1024*1024:
+                            pct = (downloaded / total_size) * 100
+                            print(f"    {pct:.0f}% ({downloaded/1048576:.0f}MB/{total_size/1048576:.0f}MB)")
+                            last_print = downloaded
+            
+            file_size = OLLAMA_EXEC.stat().st_size
+            print(f"  ✓ Downloaded: {file_size/1048576:.1f}MB")
+            
+            if file_size < 100*1024:  # Less than 100KB is suspicious
+                print(f"  ✗ File too small, might be error page")
+                OLLAMA_EXEC.unlink()
+                continue
+            
+            OLLAMA_EXEC.chmod(0o755)
+            print(f"✓ Ollama installed successfully: {OLLAMA_EXEC}")
+            return
+            
+        except requests.exceptions.Timeout:
+            print(f"  ✗ Timeout")
+            last_error = "Download timeout"
+        except requests.exceptions.RequestException as e:
+            print(f"  ✗ Request error: {e}")
+            last_error = str(e)
+        except Exception as e:
+            print(f"  ✗ Error: {e}")
+            last_error = str(e)
+        
+        # Cleanup nếu lỗi
+        if OLLAMA_EXEC.exists():
+            OLLAMA_EXEC.unlink()
+    
+    raise RuntimeError(f"Failed to download Ollama from all sources. Last error: {last_error}")
 
 install_ollama_user()
 
@@ -151,7 +232,9 @@ def wait_for_ollama(timeout=180):
 
 if not wait_for_ollama():
     print("Ollama log tail:\n", OLLAMA_LOG.read_text()[-2000:])
-    raise RuntimeError("Ollama không khởi động.")
+    raise RuntimeError("Ollama không khởi động được.")
+
+print("✓ Ollama service is ready!")
 
 # ---- Pull model ----
 _hdr(f"Pull model {MODEL}")
@@ -1070,18 +1153,29 @@ async def main():
     flask_thread.start()
     print(f"✓ Flask web server started on port {WEB_PORT}")
     
-    # Lấy token
+    # Lấy token từ environment variable
     TOKEN = os.environ.get("DISCORD_TOKEN")
     if not TOKEN:
-        import getpass
-        TOKEN = getpass.getpass("Dán Discord Bot Token: ")
+        raise RuntimeError("DISCORD_TOKEN environment variable not set!")
     
     print("Đang khởi động Discord bot...")
+    print(f"Web server: http://0.0.0.0:{WEB_PORT}")
     await bot.start(TOKEN)
 
 # Entry point
 if __name__ == "__main__":
     try:
+        # Kiểm tra token từ env trước
+        TOKEN = os.environ.get("DISCORD_TOKEN")
+        if not TOKEN:
+            print("ERROR: DISCORD_TOKEN environment variable not set!")
+            print("Please set it in Render dashboard or use: export DISCORD_TOKEN='your_token'")
+            sys.exit(1)
+        
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n✓ Bot đã dừng")
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        traceback.print_exc()
+        sys.exit(1)
