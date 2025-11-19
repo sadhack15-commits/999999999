@@ -1,8 +1,8 @@
 # ==========================
-# Discord bot + Ollama (NO SUDO, với Web Server)
+# Discord bot + Ollama (NO SUDO, với Web Server + Auto Port Detection)
 # Model: gemma3:4b (Text + Image)
 # ==========================
-import os, sys, subprocess, time, asyncio, json, re, traceback, zipfile, io, base64
+import os, sys, subprocess, time, asyncio, json, re, traceback, zipfile, io, base64, socket, random
 from pathlib import Path
 from threading import Thread
 
@@ -23,6 +23,51 @@ pip_install([
 import nest_asyncio
 import requests  # Import sớm để dùng cho Ollama install
 nest_asyncio.apply()
+
+# ---- Helper: Tìm cổng khả dụng ----
+def find_free_port(start=80, end=9000, preferred=None):
+    """Tìm cổng trống trong khoảng start-end"""
+    # Thử cổng ưu tiên trước (từ env)
+    if preferred:
+        try:
+            port = int(preferred)
+            if start <= port <= end:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    s.bind(('0.0.0.0', port))
+                    print(f"✓ Using preferred port: {port}")
+                    return port
+        except (ValueError, OSError) as e:
+            print(f"✗ Preferred port {preferred} unavailable: {e}")
+    
+    # Random search trong khoảng
+    attempts = list(range(start, end + 1))
+    random.shuffle(attempts)
+    
+    for port in attempts[:100]:  # Thử 100 cổng random
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(('0.0.0.0', port))
+                print(f"✓ Found free port: {port}")
+                return port
+        except OSError:
+            continue
+    
+    raise RuntimeError(f"Cannot find free port in range {start}-{end}")
+
+def find_free_ollama_port():
+    """Tìm cổng cho Ollama (11434-11500)"""
+    return find_free_port(11434, 11500)
+
+# ---- Tìm cổng ngay từ đầu ----
+OLLAMA_PORT = find_free_ollama_port()
+WEB_PORT = find_free_port(80, 9000, preferred=os.environ.get("PORT"))
+
+print(f"=== PORT CONFIGURATION ===")
+print(f"Web Server Port: {WEB_PORT}")
+print(f"Ollama Port: {OLLAMA_PORT}")
+print(f"==========================\n")
 
 # ---- Cài Ollama (NO SUDO - user mode) ----
 print("[ollama] Installing in user mode...")
@@ -175,8 +220,6 @@ os.environ["PATH"] = f"{OLLAMA_BIN}:{os.environ['PATH']}"
 
 # ---- Config mặc định ----
 MODEL            = "gemma3:4b"
-OLLAMA_PORT      = 11434
-WEB_PORT         = int(os.environ.get("PORT", 8080))  # Render sẽ set PORT
 WARMUP_PROMPT    = "ping"
 BOT_NICKNAME     = "Victory_vn_AI_✨"
 REQ_TIMEOUT      = 300
@@ -198,7 +241,9 @@ STATUS = {
     "last_err": "",
     "avg_sec": 0.0,
     "count": 0,
-    "uptime": 0
+    "uptime": 0,
+    "web_port": WEB_PORT,
+    "ollama_port": OLLAMA_PORT
 }
 
 def _hdr(title): print("\n" + "="*80 + f"\n[ {title} ]\n" + "="*80)
@@ -247,20 +292,25 @@ subprocess.Popen(
     stderr=subprocess.STDOUT,
     env=ollama_env
 )
-print(f"Ollama đang khởi động... (log: {OLLAMA_LOG})")
+print(f"Ollama đang khởi động trên cổng {OLLAMA_PORT}... (log: {OLLAMA_LOG})")
 
-import requests, aiohttp
+import aiohttp
 
 def wait_for_ollama(timeout=180):
     t0 = time.time()
     url = f"http://127.0.0.1:{OLLAMA_PORT}/api/tags"
+    print(f"[Ollama] Waiting for service on port {OLLAMA_PORT}...")
     while time.time() - t0 < timeout:
         try:
-            if requests.get(url, timeout=3).ok:
+            resp = requests.get(url, timeout=3)
+            if resp.ok:
+                print(f"✓ Ollama ready on port {OLLAMA_PORT}")
                 return True
-        except:
-            pass
-        time.sleep(1)
+        except requests.exceptions.ConnectionError:
+            pass  # Still starting
+        except Exception as e:
+            print(f"[Ollama] Check error: {e}")
+        time.sleep(2)
     return False
 
 if not wait_for_ollama():
@@ -420,7 +470,7 @@ def home():
     uptime = int(time.time() - START_TIME)
     return jsonify({
         "status": "ok",
-        "service": "Discord AI Bot",
+        "service": "Discord AI Bot by victory_vn",
         "model": STATUS.get("model", MODEL),
         "phase": STATUS.get("phase", "ready"),
         "uptime_seconds": uptime,
@@ -428,7 +478,13 @@ def home():
         "active_users": len(ACTIVE_USERS),
         "max_users": MAX_ACTIVE_USERS,
         "avg_response_time": f"{STATUS.get('avg_sec', 0.0):.2f}s",
-        "kb_size": len(kb_all())
+        "kb_size": len(kb_all()),
+        "ports": {
+            "web": WEB_PORT,
+            "ollama": OLLAMA_PORT
+        },
+        "url": f"http://0.0.0.0:{WEB_PORT}",
+        "endpoints": ["/", "/health", "/stats", "/ping"]
     })
 
 @app.route('/health')
@@ -443,7 +499,11 @@ def health():
     return jsonify({
         "bot_ready": bot.is_ready() if 'bot' in globals() else False,
         "ollama_ready": ollama_ok,
-        "status": STATUS
+        "status": STATUS,
+        "ports": {
+            "web": WEB_PORT,
+            "ollama": OLLAMA_PORT
+        }
     })
 
 @app.route('/stats')
@@ -456,7 +516,11 @@ def stats():
         "total_requests": STATUS.get("count", 0),
         "active_slots": f"{len(ACTIVE_USERS)}/{MAX_ACTIVE_USERS}",
         "kb_entries": len(kb_all()),
-        "last_error": STATUS.get("last_err", "")
+        "last_error": STATUS.get("last_err", ""),
+        "ports": {
+            "web": WEB_PORT,
+            "ollama": OLLAMA_PORT
+        }
     })
 
 @app.route('/ping')
@@ -466,7 +530,24 @@ def ping():
 
 def run_flask():
     """Chạy Flask server trong thread riêng"""
-    app.run(host='0.0.0.0', port=WEB_PORT, debug=False, use_reloader=False)
+    max_retries = 5
+    current_port = WEB_PORT
+    
+    for attempt in range(max_retries):
+        try:
+            print(f"[Flask] Starting on 0.0.0.0:{current_port}... (attempt {attempt + 1}/{max_retries})")
+            app.run(host='0.0.0.0', port=current_port, debug=False, use_reloader=False)
+            break
+        except OSError as e:
+            if "Address already in use" in str(e) and attempt < max_retries - 1:
+                print(f"[Flask] Port {current_port} busy, finding new port...")
+                current_port = find_free_port(current_port + 1, 9000)
+                # Update global port
+                globals()['WEB_PORT'] = current_port
+                STATUS['web_port'] = current_port
+            else:
+                print(f"[Flask] Fatal error: {e}")
+                raise
 
 # ================= Discord bot =================
 import discord
@@ -752,6 +833,7 @@ async def on_ready():
         print("Sync slash lỗi:", e)
     print(f"Bot online: {bot.user} (ID: {bot.user.id})")
     print(f"Web server: http://0.0.0.0:{WEB_PORT}")
+    print(f"UptimeRobot URL: http://YOUR_RENDER_URL:{WEB_PORT}/")
     try:
         await bot.change_presence(
             activity=discord.Game(name=f"Web: 0.0.0.0:{WEB_PORT} | Nhắn @{BOT_NICKNAME}"),
@@ -973,7 +1055,8 @@ async def info_cmd(ctx):
     await ctx.reply(
         f"{ctx.author.mention}\nCreator: victory_vn\nModel: {MODEL}\n"
         f"Uptime: {human_timedelta(up)}\nWS Ping: {ws} ms\n"
-        f"Web Server: http://0.0.0.0:{WEB_PORT}",
+        f"Web Server: http://0.0.0.0:{WEB_PORT}\n"
+        f"Ollama: http://127.0.0.1:{OLLAMA_PORT}",
         allowed_mentions=allowed_mentions
     )
 
@@ -1030,7 +1113,8 @@ async def stats_cmd(ctx):
         f"Model: {STATUS.get('model', MODEL)}\nPhase: {STATUS.get('phase','ready')}\n"
         f"Avg time: ~{STATUS.get('avg_sec',0.0):.1f}s | ETA lúc bận: ~{eta}s\n"
         f"Slots: {slots}\nRAM: {_read_free()} | Load: {_loadavg()}\n"
-        f"Profile: {PREFERRED_PROFILE}\nWeb: http://0.0.0.0:{WEB_PORT}"
+        f"Profile: {PREFERRED_PROFILE}\nWeb: http://0.0.0.0:{WEB_PORT}\n"
+        f"Ollama: http://127.0.0.1:{OLLAMA_PORT}"
     )
     await ctx.reply(msg, allowed_mentions=allowed_mentions)
 
@@ -1147,13 +1231,14 @@ async def help_cmd(ctx):
         "- !chatai @user: bot-to-bot 1 vòng\n"
         "- !status, !stats, !info, !health\n"
         "- !model [id] | !pull <model> | !warm\n"
-        "- !clear | !log [n] | !saveall\n\n"
+        "- !clear | !log [n] | !saveall | !web\n\n"
         f"**Web Endpoints** (Port {WEB_PORT}):\n"
         "- GET / → health check JSON (cho UptimeRobot)\n"
         "- GET /health → chi tiết health\n"
         "- GET /stats → statistics\n"
         "- GET /ping → simple ping\n\n"
-        f"Model: {MODEL} | Slots: {MAX_ACTIVE_USERS}"
+        f"Model: {MODEL} | Slots: {MAX_ACTIVE_USERS}\n"
+        f"Web: http://0.0.0.0:{WEB_PORT}"
     )
     try:
         await ctx.reply(
@@ -1168,13 +1253,19 @@ async def web_cmd(ctx):
     """Hiển thị thông tin web server"""
     await ctx.reply(
         f"{ctx.author.mention}\n"
-        f"Web Server đang chạy tại: http://0.0.0.0:{WEB_PORT}\n"
-        f"Endpoints:\n"
-        f"- / (health check)\n"
-        f"- /health\n"
-        f"- /stats\n"
-        f"- /ping\n\n"
-        f"Để dùng với UptimeRobot, thêm URL: http://YOUR_DOMAIN:{WEB_PORT}/",
+        f"**Web Server Info:**\n"
+        f"- Local: http://0.0.0.0:{WEB_PORT}\n"
+        f"- Ollama: http://127.0.0.1:{OLLAMA_PORT}\n\n"
+        f"**Endpoints:**\n"
+        f"- GET / (health check)\n"
+        f"- GET /health (chi tiết)\n"
+        f"- GET /stats (thống kê)\n"
+        f"- GET /ping (test)\n\n"
+        f"**UptimeRobot Setup:**\n"
+        f"1. Lấy URL từ Render dashboard\n"
+        f"2. Thêm vào UptimeRobot: https://YOUR_RENDER_URL/\n"
+        f"3. Interval: 5 phút\n"
+        f"4. Monitor Type: HTTP(s)",
         allowed_mentions=allowed_mentions
     )
 
@@ -1185,6 +1276,7 @@ async def main():
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
     print(f"✓ Flask web server started on port {WEB_PORT}")
+    print(f"✓ UptimeRobot endpoint: http://0.0.0.0:{WEB_PORT}/")
     
     # Lấy token từ environment variable
     TOKEN = os.environ.get("DISCORD_TOKEN")
@@ -1193,6 +1285,7 @@ async def main():
     
     print("Đang khởi động Discord bot...")
     print(f"Web server: http://0.0.0.0:{WEB_PORT}")
+    print(f"Ollama API: http://127.0.0.1:{OLLAMA_PORT}")
     await bot.start(TOKEN)
 
 # Entry point
