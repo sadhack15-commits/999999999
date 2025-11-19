@@ -32,7 +32,7 @@ OLLAMA_BIN = OLLAMA_DIR / "bin"
 OLLAMA_EXEC = OLLAMA_BIN / "ollama"
 
 def install_ollama_user():
-    """Cài Ollama không cần sudo - Download trực tiếp binary"""
+    """Cài Ollama không cần sudo - Download từ GitHub releases"""
     if OLLAMA_EXEC.exists():
         print(f"✓ Ollama đã có tại: {OLLAMA_EXEC}")
         return
@@ -40,6 +40,8 @@ def install_ollama_user():
     OLLAMA_BIN.mkdir(parents=True, exist_ok=True)
     
     import platform
+    import tarfile
+    
     system = platform.system().lower()
     arch = platform.machine().lower()
     
@@ -50,24 +52,16 @@ def install_ollama_user():
     else:
         raise RuntimeError(f"Unsupported architecture: {arch}")
     
-    # URL cố định từ Ollama CDN (không redirect)
-    base_url = "https://ollama.com/download"
-    version = "0.5.14"  # Version ổn định
-    
-    # Thử CDN trước, sau đó GitHub
-    urls_to_try = [
-        # CDN chính thức
-        f"{base_url}/ollama-{system}-{arch}",
-        # GitHub releases (versions cũ hơn nhưng stable)
-        f"https://github.com/ollama/ollama/releases/download/v{version}/ollama-{system}-{arch}",
-        f"https://github.com/ollama/ollama/releases/download/v0.5.10/ollama-{system}-{arch}",
-        f"https://github.com/ollama/ollama/releases/download/v0.5.8/ollama-{system}-{arch}",
-    ]
+    # GitHub releases có file .tgz (tarball)
+    versions_to_try = ["v0.6.5", "v0.5.14", "v0.5.10", "v0.5.8", "v0.5.0", "v0.1.30"]
     
     last_error = None
-    for idx, url in enumerate(urls_to_try, 1):
+    for idx, version in enumerate(versions_to_try, 1):
         try:
-            print(f"\n[{idx}/{len(urls_to_try)}] Trying: {url}")
+            filename = f"ollama-{system}-{arch}.tgz"
+            url = f"https://github.com/ollama/ollama/releases/download/{version}/{filename}"
+            
+            print(f"\n[{idx}/{len(versions_to_try)}] Trying {version}: {url}")
             
             response = requests.get(
                 url,
@@ -87,53 +81,92 @@ def install_ollama_user():
             
             total_size = int(response.headers.get('content-length', 0))
             if total_size == 0:
-                print(f"  ✗ Empty file or unknown size")
+                print(f"  ✗ Empty or unknown size")
                 continue
             
             print(f"  ✓ Found! Downloading {total_size/1048576:.1f}MB...")
             
+            # Download to temp file
+            tgz_path = OLLAMA_BIN / filename
             downloaded = 0
             last_print = 0
             
-            with open(OLLAMA_EXEC, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=65536):  # 64KB chunks
+            with open(tgz_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=65536):
                     if chunk:
                         f.write(chunk)
                         downloaded += len(chunk)
                         
-                        # Print progress every 5MB
+                        # Print every 5MB
                         if downloaded - last_print >= 5*1024*1024:
                             pct = (downloaded / total_size) * 100
                             print(f"    {pct:.0f}% ({downloaded/1048576:.0f}MB/{total_size/1048576:.0f}MB)")
                             last_print = downloaded
             
-            file_size = OLLAMA_EXEC.stat().st_size
-            print(f"  ✓ Downloaded: {file_size/1048576:.1f}MB")
+            print(f"  ✓ Downloaded: {tgz_path.stat().st_size/1048576:.1f}MB")
             
-            if file_size < 100*1024:  # Less than 100KB is suspicious
-                print(f"  ✗ File too small, might be error page")
-                OLLAMA_EXEC.unlink()
+            # Extract tarball
+            print(f"  Extracting...")
+            try:
+                with tarfile.open(tgz_path, 'r:gz') as tar:
+                    # Tìm binary trong tarball
+                    members = tar.getmembers()
+                    ollama_member = None
+                    
+                    for member in members:
+                        if member.name.endswith('/ollama') or member.name == 'ollama' or member.name.endswith('/bin/ollama'):
+                            ollama_member = member
+                            break
+                    
+                    if not ollama_member:
+                        print(f"  ✗ No ollama binary found in tarball")
+                        tgz_path.unlink()
+                        continue
+                    
+                    # Extract binary
+                    tar.extract(ollama_member, path=OLLAMA_BIN)
+                    extracted_path = OLLAMA_BIN / ollama_member.name
+                    
+                    # Move to final location
+                    if extracted_path != OLLAMA_EXEC:
+                        extracted_path.rename(OLLAMA_EXEC)
+                    
+                    OLLAMA_EXEC.chmod(0o755)
+                
+                # Cleanup
+                tgz_path.unlink()
+                
+                # Verify
+                file_size = OLLAMA_EXEC.stat().st_size
+                if file_size < 10*1024*1024:  # Less than 10MB is suspicious
+                    print(f"  ✗ Binary too small ({file_size/1048576:.1f}MB)")
+                    OLLAMA_EXEC.unlink()
+                    continue
+                
+                print(f"✓ Ollama {version} installed: {OLLAMA_EXEC} ({file_size/1048576:.1f}MB)")
+                return
+                
+            except tarfile.TarError as e:
+                print(f"  ✗ Extract error: {e}")
+                last_error = str(e)
+                if tgz_path.exists():
+                    tgz_path.unlink()
+                if OLLAMA_EXEC.exists():
+                    OLLAMA_EXEC.unlink()
                 continue
             
-            OLLAMA_EXEC.chmod(0o755)
-            print(f"✓ Ollama installed successfully: {OLLAMA_EXEC}")
-            return
-            
         except requests.exceptions.Timeout:
-            print(f"  ✗ Timeout")
-            last_error = "Download timeout"
+            print(f"  ✗ Download timeout")
+            last_error = "Timeout"
         except requests.exceptions.RequestException as e:
             print(f"  ✗ Request error: {e}")
             last_error = str(e)
         except Exception as e:
             print(f"  ✗ Error: {e}")
             last_error = str(e)
-        
-        # Cleanup nếu lỗi
-        if OLLAMA_EXEC.exists():
-            OLLAMA_EXEC.unlink()
+            traceback.print_exc()
     
-    raise RuntimeError(f"Failed to download Ollama from all sources. Last error: {last_error}")
+    raise RuntimeError(f"Failed to install Ollama from all sources. Last error: {last_error}")
 
 install_ollama_user()
 
