@@ -1,0 +1,6 @@
+# VPS Terminal 24/7 - Dependencies
+# Không cần thư viện bên ngoài vì script chỉ dùng Python built-in modules
+
+# Optional: nếu muốn thêm tính năng
+# requests==2.31.0
+# psutil==5.9.6
