@@ -268,6 +268,13 @@ if not KB_FILE.exists():
 def run_cmd(cmd, desc=None, env=None, allow_fail=False):
     if desc: _hdr(desc)
     print(f"$ {' '.join(cmd)}")
+    
+    # Set environment cho Ollama commands
+    if env is None:
+        env = os.environ.copy()
+    if 'ollama' in ' '.join(cmd):
+        env["OLLAMA_HOST"] = f"127.0.0.1:{OLLAMA_PORT}"
+    
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, bufsize=1, env=env)
     for line in p.stdout:
@@ -285,6 +292,9 @@ OLLAMA_LOG.write_text("")
 ollama_env = os.environ.copy()
 ollama_env["OLLAMA_HOST"] = f"127.0.0.1:{OLLAMA_PORT}"
 ollama_env["OLLAMA_MODELS"] = str(DATA_DIR / "models")
+ollama_env["OLLAMA_KEEP_ALIVE"] = "24h"
+ollama_env["OLLAMA_NUM_PARALLEL"] = str(MAX_ACTIVE_USERS)
+ollama_env["OLLAMA_MAX_LOADED_MODELS"] = "1"
 
 subprocess.Popen(
     [str(OLLAMA_EXEC), "serve"],
@@ -293,6 +303,7 @@ subprocess.Popen(
     env=ollama_env
 )
 print(f"Ollama đang khởi động trên cổng {OLLAMA_PORT}... (log: {OLLAMA_LOG})")
+print(f"Waiting for Ollama to be fully ready (this may take 30-60s)...")
 
 import aiohttp
 
@@ -300,17 +311,25 @@ def wait_for_ollama(timeout=180):
     t0 = time.time()
     url = f"http://127.0.0.1:{OLLAMA_PORT}/api/tags"
     print(f"[Ollama] Waiting for service on port {OLLAMA_PORT}...")
+    consecutive_success = 0
     while time.time() - t0 < timeout:
         try:
-            resp = requests.get(url, timeout=3)
+            resp = requests.get(url, timeout=5)
             if resp.ok:
-                print(f"✓ Ollama ready on port {OLLAMA_PORT}")
-                return True
+                consecutive_success += 1
+                print(f"[Ollama] Response OK ({consecutive_success}/3)")
+                if consecutive_success >= 3:
+                    print(f"✓ Ollama fully ready on port {OLLAMA_PORT}")
+                    time.sleep(2)  # Extra buffer
+                    return True
+            else:
+                consecutive_success = 0
         except requests.exceptions.ConnectionError:
-            pass  # Still starting
+            consecutive_success = 0
         except Exception as e:
             print(f"[Ollama] Check error: {e}")
-        time.sleep(2)
+            consecutive_success = 0
+        time.sleep(3)
     return False
 
 if not wait_for_ollama():
@@ -321,7 +340,28 @@ print("✓ Ollama service is ready!")
 
 # ---- Pull model ----
 _hdr(f"Pull model {MODEL}")
-run_cmd([str(OLLAMA_EXEC), "pull", MODEL], allow_fail=False)
+max_pull_attempts = 3
+for attempt in range(max_pull_attempts):
+    try:
+        print(f"[Pull] Attempt {attempt + 1}/{max_pull_attempts}...")
+        result = run_cmd([str(OLLAMA_EXEC), "pull", MODEL], allow_fail=True)
+        if result == 0:
+            print(f"✓ Model {MODEL} pulled successfully")
+            break
+        else:
+            print(f"✗ Pull failed with exit code {result}")
+            if attempt < max_pull_attempts - 1:
+                print(f"Waiting 5s before retry...")
+                time.sleep(5)
+    except Exception as e:
+        print(f"✗ Pull error: {e}")
+        if attempt < max_pull_attempts - 1:
+            print(f"Waiting 5s before retry...")
+            time.sleep(5)
+        else:
+            print(f"WARNING: Failed to pull model after {max_pull_attempts} attempts")
+            print(f"Bot will start but model may not be available until manually pulled")
+            STATUS["last_err"] = f"Model pull failed: {e}"
 
 # ---- Warm-up ----
 def _warm(label, prompt):
