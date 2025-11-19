@@ -25,44 +25,37 @@ import requests  # Import sớm để dùng cho Ollama install
 nest_asyncio.apply()
 
 # ---- Helper: Tìm cổng khả dụng ----
-def find_free_port(start=80, end=9000, preferred=None):
-    """Tìm cổng trống trong khoảng start-end"""
-    # Thử cổng ưu tiên trước (từ env)
-    if preferred:
-        try:
-            port = int(preferred)
-            if start <= port <= end:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    s.bind(('0.0.0.0', port))
-                    print(f"✓ Using preferred port: {port}")
-                    return port
-        except (ValueError, OSError) as e:
-            print(f"✗ Preferred port {preferred} unavailable: {e}")
-    
-    # Random search trong khoảng
-    attempts = list(range(start, end + 1))
-    random.shuffle(attempts)
-    
-    for port in attempts[:100]:  # Thử 100 cổng random
+def find_free_port(ports_to_try):
+    """Thử từng cổng trong danh sách cho đến khi tìm thấy cổng trống"""
+    for port in ports_to_try:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 s.bind(('0.0.0.0', port))
                 print(f"✓ Found free port: {port}")
                 return port
-        except OSError:
+        except OSError as e:
+            print(f"✗ Port {port} unavailable: {e}")
             continue
     
-    raise RuntimeError(f"Cannot find free port in range {start}-{end}")
+    raise RuntimeError(f"Cannot find any free port from: {ports_to_try}")
 
 def find_free_ollama_port():
-    """Tìm cổng cho Ollama (11434-11500)"""
-    return find_free_port(11434, 11500)
+    """Tìm cổng cho Ollama - thử 11434 trước, sau đó 11475"""
+    return find_free_port([11434, 11475])
 
 # ---- Tìm cổng ngay từ đầu ----
 OLLAMA_PORT = find_free_ollama_port()
-WEB_PORT = find_free_port(80, 9000, preferred=os.environ.get("PORT"))
+
+# Thử cổng từ biến môi trường trước, nếu không có thì thử 8080, 80, 9000
+preferred_port = os.environ.get("PORT")
+if preferred_port:
+    try:
+        WEB_PORT = find_free_port([int(preferred_port)])
+    except:
+        WEB_PORT = find_free_port([8080, 80, 9000])
+else:
+    WEB_PORT = find_free_port([8080, 80, 9000])
 
 print(f"=== PORT CONFIGURATION ===")
 print(f"Web Server Port: {WEB_PORT}")
@@ -570,24 +563,12 @@ def ping():
 
 def run_flask():
     """Chạy Flask server trong thread riêng"""
-    max_retries = 5
-    current_port = WEB_PORT
-    
-    for attempt in range(max_retries):
-        try:
-            print(f"[Flask] Starting on 0.0.0.0:{current_port}... (attempt {attempt + 1}/{max_retries})")
-            app.run(host='0.0.0.0', port=current_port, debug=False, use_reloader=False)
-            break
-        except OSError as e:
-            if "Address already in use" in str(e) and attempt < max_retries - 1:
-                print(f"[Flask] Port {current_port} busy, finding new port...")
-                current_port = find_free_port(current_port + 1, 9000)
-                # Update global port
-                globals()['WEB_PORT'] = current_port
-                STATUS['web_port'] = current_port
-            else:
-                print(f"[Flask] Fatal error: {e}")
-                raise
+    try:
+        print(f"[Flask] Starting on 0.0.0.0:{WEB_PORT}...")
+        app.run(host='0.0.0.0', port=WEB_PORT, debug=False, use_reloader=False)
+    except OSError as e:
+        print(f"[Flask] Fatal error: {e}")
+        raise
 
 # ================= Discord bot =================
 import discord
