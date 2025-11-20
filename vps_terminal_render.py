@@ -198,6 +198,161 @@ RAG_TOPK = 1  # Giảm RAG
 RAG_CHARS = 200
 PREFERRED_PROFILE = "L3-ultra"  # Dùng profile nhỏ nhất
 
+# ===== RAM MONITORING =====
+RAM_LIMIT_MB = 512
+RAM_WARNING_MB = 400  # Cảnh báo khi đạt 400MB (78%)
+RAM_CRITICAL_MB = 480  # Nguy hiểm khi đạt 480MB (94%)
+RAM_CHECK_INTERVAL = 30  # Kiểm tra mỗi 30s
+RAM_HISTORY = []  # Lưu lịch sử RAM
+MAX_RAM_HISTORY = 100
+
+def get_memory_usage():
+    """Lấy thông tin RAM usage (MB)"""
+    try:
+        # Đọc từ /proc/self/status (chính xác nhất cho process hiện tại)
+        with open('/proc/self/status', 'r') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):  # Resident Set Size (RAM thực tế)
+                    rss_kb = int(line.split()[1])
+                    return rss_kb / 1024  # Convert KB -> MB
+        
+        # Fallback: dùng /proc/meminfo
+        with open('/proc/meminfo', 'r') as f:
+            meminfo = {}
+            for line in f:
+                parts = line.split(':')
+                if len(parts) == 2:
+                    key = parts[0].strip()
+                    value = int(parts[1].strip().split()[0])
+                    meminfo[key] = value / 1024  # KB -> MB
+            
+            used = meminfo.get('MemTotal', 0) - meminfo.get('MemAvailable', 0)
+            return used
+    except:
+        # Fallback cuối: dùng psutil nếu có
+        try:
+            import psutil
+            process = psutil.Process()
+            return process.memory_info().rss / (1024 * 1024)
+        except:
+            return 0
+
+def check_ram_and_cleanup():
+    """Kiểm tra RAM và cleanup nếu cần"""
+    current_mb = get_memory_usage()
+    timestamp = time.time()
+    
+    # Lưu lịch sử
+    RAM_HISTORY.append({"ts": timestamp, "mb": current_mb})
+    if len(RAM_HISTORY) > MAX_RAM_HISTORY:
+        RAM_HISTORY.pop(0)
+    
+    # Cập nhật STATUS
+    STATUS["ram_mb"] = current_mb
+    STATUS["ram_pct"] = (current_mb / RAM_LIMIT_MB) * 100
+    
+    # Cảnh báo
+    if current_mb >= RAM_CRITICAL_MB:
+        print(f"🔴 CRITICAL RAM: {current_mb:.1f}MB / {RAM_LIMIT_MB}MB ({STATUS['ram_pct']:.1f}%)")
+        # Emergency cleanup
+        emergency_cleanup()
+        return "critical"
+    elif current_mb >= RAM_WARNING_MB:
+        print(f"🟡 WARNING RAM: {current_mb:.1f}MB / {RAM_LIMIT_MB}MB ({STATUS['ram_pct']:.1f}%)")
+        # Soft cleanup
+        soft_cleanup()
+        return "warning"
+    else:
+        return "ok"
+
+def soft_cleanup():
+    """Cleanup nhẹ: xóa history cũ, giới hạn KB"""
+    try:
+        # Xóa history channels cũ (giữ 5 mới nhất)
+        if HIST_DIR.exists():
+            files = sorted(HIST_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+            for f in files[5:]:
+                f.unlink()
+        
+        # Giới hạn KB size
+        if KB_FILE.exists():
+            lines = KB_FILE.read_text().splitlines()
+            if len(lines) > 50:  # Giữ 50 mục mới nhất
+                KB_FILE.write_text("\n".join(lines[-50:]) + "\n")
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+        
+        print(f"✓ Soft cleanup completed")
+    except Exception as e:
+        print(f"✗ Soft cleanup failed: {e}")
+
+def emergency_cleanup():
+    """Cleanup khẩn cấp: xóa tất cả cache, restart Ollama"""
+    try:
+        print("🚨 EMERGENCY CLEANUP STARTED")
+        
+        # 1. Clear tất cả history
+        if HIST_DIR.exists():
+            for f in HIST_DIR.glob("*.json"):
+                f.unlink()
+        
+        # 2. Clear KB
+        if KB_FILE.exists():
+            KB_FILE.write_text("")
+        
+        # 3. Force GC nhiều lần
+        import gc
+        for _ in range(3):
+            gc.collect()
+        
+        # 4. Kill và restart Ollama (giải phóng model cache)
+        try:
+            subprocess.run(["pkill", "-9", "-f", "ollama serve"], check=False)
+            time.sleep(2)
+            
+            ollama_env = os.environ.copy()
+            ollama_env["OLLAMA_HOST"] = f"127.0.0.1:{OLLAMA_PORT}"
+            ollama_env["OLLAMA_MODELS"] = str(DATA_DIR / "models")
+            ollama_env["OLLAMA_KEEP_ALIVE"] = "5m"
+            ollama_env["OLLAMA_NUM_PARALLEL"] = "1"
+            ollama_env["OLLAMA_MAX_LOADED_MODELS"] = "1"
+            ollama_env["OLLAMA_MAX_VRAM"] = "200m"  # Giảm xuống 200MB
+            
+            subprocess.Popen(
+                [str(OLLAMA_EXEC), "serve"],
+                stdout=open(OLLAMA_LOG, 'a'),
+                stderr=subprocess.STDOUT,
+                env=ollama_env
+            )
+            print("✓ Ollama restarted")
+        except Exception as e:
+            print(f"✗ Ollama restart failed: {e}")
+        
+        print("✓ Emergency cleanup completed")
+    except Exception as e:
+        print(f"✗ Emergency cleanup failed: {e}")
+
+async def ram_monitor_loop():
+    """Background task để monitor RAM liên tục"""
+    await asyncio.sleep(10)  # Đợi bot khởi động
+    
+    while True:
+        try:
+            status = check_ram_and_cleanup()
+            
+            # Log mỗi 5 phút
+            if int(time.time()) % 300 < RAM_CHECK_INTERVAL:
+                current_mb = STATUS.get("ram_mb", 0)
+                avg_mb = sum(h["mb"] for h in RAM_HISTORY[-10:]) / min(10, len(RAM_HISTORY)) if RAM_HISTORY else 0
+                print(f"📊 RAM: Current={current_mb:.1f}MB, Avg(10)={avg_mb:.1f}MB, Status={status}")
+            
+        except Exception as e:
+            print(f"RAM monitor error: {e}")
+        
+        await asyncio.sleep(RAM_CHECK_INTERVAL)
+
 # ---- STATUS ----
 STATUS = {
     "phase": "starting",
@@ -210,7 +365,10 @@ STATUS = {
     "count": 0,
     "uptime": 0,
     "web_port": WEB_PORT,
-    "ollama_port": OLLAMA_PORT
+    "ollama_port": OLLAMA_PORT,
+    "ram_mb": 0,
+    "ram_pct": 0,
+    "ram_status": "ok"
 }
 
 def _hdr(title): print("\n" + "="*80 + f"\n[ {title} ]\n" + "="*80)
@@ -459,13 +617,21 @@ app = Flask(__name__)
 @app.route('/')
 def home():
     uptime = int(time.time() - START_TIME)
+    ram_mb = STATUS.get("ram_mb", 0)
+    ram_pct = STATUS.get("ram_pct", 0)
+    
     return jsonify({
         "status": "ok",
         "service": "Discord AI Bot (512MB optimized)",
         "model": MODEL,
         "phase": STATUS.get("phase", "ready"),
         "uptime_seconds": uptime,
-        "ram_limit": "512MB",
+        "ram": {
+            "current_mb": round(ram_mb, 1),
+            "limit_mb": RAM_LIMIT_MB,
+            "usage_pct": round(ram_pct, 1),
+            "status": STATUS.get("ram_status", "ok")
+        },
         "ports": {"web": WEB_PORT, "ollama": OLLAMA_PORT}
     })
 
@@ -477,25 +643,72 @@ def health():
     except:
         ollama_ok = False
     
+    ram_mb = STATUS.get("ram_mb", 0)
+    ram_pct = STATUS.get("ram_pct", 0)
+    
     return jsonify({
         "bot_ready": bot.is_ready() if 'bot' in globals() else False,
         "ollama_ready": ollama_ok,
-        "status": STATUS
+        "ram_ok": ram_mb < RAM_WARNING_MB,
+        "status": STATUS,
+        "ram_history": RAM_HISTORY[-20:] if RAM_HISTORY else []
     })
 
 @app.route('/stats')
 def stats():
+    ram_mb = STATUS.get("ram_mb", 0)
+    ram_pct = STATUS.get("ram_pct", 0)
+    avg_ram = sum(h["mb"] for h in RAM_HISTORY[-10:]) / min(10, len(RAM_HISTORY)) if RAM_HISTORY else 0
+    
     return jsonify({
         "model": MODEL,
         "phase": STATUS.get("phase"),
         "avg_sec": STATUS.get("avg_sec", 0.0),
         "total_requests": STATUS.get("count", 0),
-        "active_slots": f"{len(ACTIVE_USERS)}/{MAX_ACTIVE_USERS}"
+        "active_slots": f"{len(ACTIVE_USERS)}/{MAX_ACTIVE_USERS}",
+        "ram": {
+            "current_mb": round(ram_mb, 1),
+            "avg_mb": round(avg_ram, 1),
+            "limit_mb": RAM_LIMIT_MB,
+            "usage_pct": round(ram_pct, 1),
+            "warning_mb": RAM_WARNING_MB,
+            "critical_mb": RAM_CRITICAL_MB
+        }
     })
 
 @app.route('/ping')
 def ping():
     return "pong", 200
+
+@app.route('/ram')
+def ram_info():
+    """Endpoint chi tiết về RAM usage"""
+    ram_mb = STATUS.get("ram_mb", 0)
+    ram_pct = STATUS.get("ram_pct", 0)
+    
+    history_5m = [h for h in RAM_HISTORY if time.time() - h["ts"] < 300]
+    history_1h = [h for h in RAM_HISTORY if time.time() - h["ts"] < 3600]
+    
+    return jsonify({
+        "current": {
+            "mb": round(ram_mb, 1),
+            "pct": round(ram_pct, 1),
+            "status": "🔴 CRITICAL" if ram_mb >= RAM_CRITICAL_MB else "🟡 WARNING" if ram_mb >= RAM_WARNING_MB else "🟢 OK"
+        },
+        "limits": {
+            "total_mb": RAM_LIMIT_MB,
+            "warning_mb": RAM_WARNING_MB,
+            "critical_mb": RAM_CRITICAL_MB
+        },
+        "stats": {
+            "avg_5m": round(sum(h["mb"] for h in history_5m) / len(history_5m), 1) if history_5m else 0,
+            "max_5m": round(max((h["mb"] for h in history_5m), default=0), 1),
+            "avg_1h": round(sum(h["mb"] for h in history_1h) / len(history_1h), 1) if history_1h else 0,
+            "max_1h": round(max((h["mb"] for h in history_1h), default=0), 1)
+        },
+        "history_count": len(RAM_HISTORY),
+        "last_cleanup": STATUS.get("last_cleanup", "never")
+    })
 
 def run_flask():
     try:
@@ -697,9 +910,14 @@ async def on_ready():
         pass
     print(f"Bot online: {bot.user} (ID: {bot.user.id})")
     print(f"Web server: http://0.0.0.0:{WEB_PORT}")
+    
+    # Start RAM monitoring
+    bot.loop.create_task(ram_monitor_loop())
+    print("✓ RAM monitoring started")
+    
     try:
         await bot.change_presence(
-            activity=discord.Game(name=f"RAM: 512MB | Model: {MODEL}"),
+            activity=discord.Game(name=f"RAM: {STATUS.get('ram_mb', 0):.0f}/{RAM_LIMIT_MB}MB"),
             status=discord.Status.online
         )
     except:
@@ -896,11 +1114,16 @@ async def status_cmd(ctx):
 
 @bot.command(name="stats")
 async def stats_cmd(ctx):
+    ram_mb = STATUS.get("ram_mb", 0)
+    ram_pct = STATUS.get("ram_pct", 0)
+    ram_status = "🔴" if ram_mb >= RAM_CRITICAL_MB else "🟡" if ram_mb >= RAM_WARNING_MB else "🟢"
+    
     slots = f"{len(ACTIVE_USERS)}/{MAX_ACTIVE_USERS}"
     msg = (
         f"Model: {MODEL}\nPhase: {STATUS.get('phase','ready')}\n"
         f"Avg: ~{STATUS.get('avg_sec',0.0):.1f}s\n"
-        f"Slots: {slots}\nRAM: 512MB limit\n"
+        f"Slots: {slots}\n"
+        f"{ram_status} RAM: {ram_mb:.1f}/{RAM_LIMIT_MB}MB ({ram_pct:.0f}%)\n"
         f"Web: http://0.0.0.0:{WEB_PORT}"
     )
     await ctx.reply(msg, allowed_mentions=allowed_mentions)
