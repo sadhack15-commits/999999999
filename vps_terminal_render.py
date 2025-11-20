@@ -1,8 +1,8 @@
 # ==========================
-# Discord bot + Ollama (NO SUDO, với Web Server + Auto Port Detection)
-# Model: gemma3:4b (Text + Image)
+# Discord bot + Ollama (OPTIMIZED FOR 512MB RAM)
+# Model: qwen2.5:0.5b (Tiny model for low RAM)
 # ==========================
-import os, sys, subprocess, time, asyncio, json, re, traceback, zipfile, io, base64, socket, random
+import os, sys, subprocess, time, asyncio, json, re, traceback, zipfile, io, base64, socket
 from pathlib import Path
 from threading import Thread
 
@@ -11,22 +11,22 @@ def pip_install(pkgs):
     print("[pip] Installing:", " ".join(pkgs))
     subprocess.run([sys.executable, "-m", "pip", "install", "-U", *pkgs], check=True)
 
+# GIẢM DEPENDENCIES - chỉ cài những thứ cần thiết
 pip_install([
     "discord.py>=2.4.0",
     "aiohttp>=3.9.5",
     "requests>=2.31.0",
-    "scikit-learn>=1.3.0",
     "nest_asyncio>=1.6.0",
     "flask>=3.0.0"
+    # BỎ: scikit-learn (100MB), tensorflow (nặng)
 ])
 
 import nest_asyncio
-import requests  # Import sớm để dùng cho Ollama install
+import requests
 nest_asyncio.apply()
 
 # ---- Helper: Tìm cổng khả dụng ----
 def find_free_port(ports_to_try):
-    """Thử từng cổng trong danh sách cho đến khi tìm thấy cổng trống"""
     for port in ports_to_try:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -37,17 +37,14 @@ def find_free_port(ports_to_try):
         except OSError as e:
             print(f"✗ Port {port} unavailable: {e}")
             continue
-    
     raise RuntimeError(f"Cannot find any free port from: {ports_to_try}")
 
 def find_free_ollama_port():
-    """Tìm cổng cho Ollama - thử 11434 trước, sau đó 11475"""
     return find_free_port([11434, 11475])
 
 # ---- Tìm cổng ngay từ đầu ----
 OLLAMA_PORT = find_free_ollama_port()
 
-# Thử cổng từ biến môi trường trước, nếu không có thì thử 8080, 80, 9000
 preferred_port = os.environ.get("PORT")
 if preferred_port:
     try:
@@ -70,7 +67,6 @@ OLLAMA_BIN = OLLAMA_DIR / "bin"
 OLLAMA_EXEC = OLLAMA_BIN / "ollama"
 
 def install_ollama_user():
-    """Cài Ollama không cần sudo - Download từ GitHub releases"""
     if OLLAMA_EXEC.exists():
         print(f"✓ Ollama đã có tại: {OLLAMA_EXEC}")
         return
@@ -90,8 +86,7 @@ def install_ollama_user():
     else:
         raise RuntimeError(f"Unsupported architecture: {arch}")
     
-    # GitHub releases có file .tgz (tarball)
-    versions_to_try = ["v0.6.5", "v0.5.14", "v0.5.10", "v0.5.8", "v0.5.0", "v0.1.30"]
+    versions_to_try = ["v0.6.5", "v0.5.14", "v0.5.10"]
     
     last_error = None
     for idx, version in enumerate(versions_to_try, 1):
@@ -109,10 +104,6 @@ def install_ollama_user():
                 headers={'User-Agent': 'Mozilla/5.0'}
             )
             
-            if response.status_code == 404:
-                print(f"  ✗ Not found (404)")
-                continue
-            
             if response.status_code != 200:
                 print(f"  ✗ HTTP {response.status_code}")
                 continue
@@ -124,7 +115,6 @@ def install_ollama_user():
             
             print(f"  ✓ Found! Downloading {total_size/1048576:.1f}MB...")
             
-            # Download to temp file
             tgz_path = OLLAMA_BIN / filename
             downloaded = 0
             last_print = 0
@@ -135,19 +125,16 @@ def install_ollama_user():
                         f.write(chunk)
                         downloaded += len(chunk)
                         
-                        # Print every 5MB
                         if downloaded - last_print >= 5*1024*1024:
                             pct = (downloaded / total_size) * 100
                             print(f"    {pct:.0f}% ({downloaded/1048576:.0f}MB/{total_size/1048576:.0f}MB)")
                             last_print = downloaded
             
             print(f"  ✓ Downloaded: {tgz_path.stat().st_size/1048576:.1f}MB")
-            
-            # Extract tarball
             print(f"  Extracting...")
+            
             try:
                 with tarfile.open(tgz_path, 'r:gz') as tar:
-                    # Tìm binary trong tarball
                     members = tar.getmembers()
                     ollama_member = None
                     
@@ -161,22 +148,18 @@ def install_ollama_user():
                         tgz_path.unlink()
                         continue
                     
-                    # Extract binary
                     tar.extract(ollama_member, path=OLLAMA_BIN)
                     extracted_path = OLLAMA_BIN / ollama_member.name
                     
-                    # Move to final location
                     if extracted_path != OLLAMA_EXEC:
                         extracted_path.rename(OLLAMA_EXEC)
                     
                     OLLAMA_EXEC.chmod(0o755)
                 
-                # Cleanup
                 tgz_path.unlink()
                 
-                # Verify
                 file_size = OLLAMA_EXEC.stat().st_size
-                if file_size < 10*1024*1024:  # Less than 10MB is suspicious
+                if file_size < 10*1024*1024:
                     print(f"  ✗ Binary too small ({file_size/1048576:.1f}MB)")
                     OLLAMA_EXEC.unlink()
                     continue
@@ -193,36 +176,27 @@ def install_ollama_user():
                     OLLAMA_EXEC.unlink()
                 continue
             
-        except requests.exceptions.Timeout:
-            print(f"  ✗ Download timeout")
-            last_error = "Timeout"
-        except requests.exceptions.RequestException as e:
-            print(f"  ✗ Request error: {e}")
-            last_error = str(e)
         except Exception as e:
             print(f"  ✗ Error: {e}")
             last_error = str(e)
-            traceback.print_exc()
     
-    raise RuntimeError(f"Failed to install Ollama from all sources. Last error: {last_error}")
+    raise RuntimeError(f"Failed to install Ollama. Last error: {last_error}")
 
 install_ollama_user()
-
-# Thêm vào PATH
 os.environ["PATH"] = f"{OLLAMA_BIN}:{os.environ['PATH']}"
 
-# ---- Config mặc định ----
-MODEL            = "gemma3:4b"
-WARMUP_PROMPT    = "ping"
-BOT_NICKNAME     = "Victory_vn_AI_✨"
-REQ_TIMEOUT      = 300
-DISCORD_MAX      = 1900
-HISTORY_TURNS    = 4
-MAX_ACTIVE_USERS = 2
-BRAIN_MAX_CHARS  = 0
-RAG_TOPK         = 2
-RAG_CHARS        = 400
-PREFERRED_PROFILE= "L1-fast"
+# ⚠️ CRITICAL: Model nhỏ cho 512MB RAM
+MODEL = "qwen2.5:0.5b"  # Model 500M parameters, chỉ ~350MB RAM
+WARMUP_PROMPT = "hi"
+BOT_NICKNAME = "Victory_vn_AI_✨"
+REQ_TIMEOUT = 180  # Giảm timeout
+DISCORD_MAX = 1900
+HISTORY_TURNS = 2  # Giảm history để tiết kiệm RAM
+MAX_ACTIVE_USERS = 1  # CHỈ 1 user đồng thời cho 512MB
+BRAIN_MAX_CHARS = 0
+RAG_TOPK = 1  # Giảm RAG
+RAG_CHARS = 200
+PREFERRED_PROFILE = "L3-ultra"  # Dùng profile nhỏ nhất
 
 # ---- STATUS ----
 STATUS = {
@@ -242,11 +216,11 @@ STATUS = {
 def _hdr(title): print("\n" + "="*80 + f"\n[ {title} ]\n" + "="*80)
 
 # ---- Data dirs ----
-DATA_DIR   = Path.home() / "bot_data"  # Dùng home directory
-BRAIN_DIR  = DATA_DIR / "brain" / "users"
-HIST_DIR   = DATA_DIR / "history" / "channels"
-CONF_FILE  = DATA_DIR / "config.json"
-KB_FILE    = DATA_DIR / "kb.jsonl"
+DATA_DIR = Path.home() / "bot_data"
+BRAIN_DIR = DATA_DIR / "brain" / "users"
+HIST_DIR = DATA_DIR / "history" / "channels"
+CONF_FILE = DATA_DIR / "config.json"
+KB_FILE = DATA_DIR / "kb.jsonl"
 OLLAMA_LOG = DATA_DIR / "logs" / "ollama.log"
 
 for p in [BRAIN_DIR, HIST_DIR, OLLAMA_LOG.parent]:
@@ -262,7 +236,6 @@ def run_cmd(cmd, desc=None, env=None, allow_fail=False):
     if desc: _hdr(desc)
     print(f"$ {' '.join(cmd)}")
     
-    # Set environment cho Ollama commands
     if env is None:
         env = os.environ.copy()
     if 'ollama' in ' '.join(cmd):
@@ -277,17 +250,19 @@ def run_cmd(cmd, desc=None, env=None, allow_fail=False):
         raise RuntimeError(f"Command failed (exit={ret}): {' '.join(cmd)}")
     return ret
 
-run_cmd(["pkill", "-f", "ollama serve"], "Kill tiến trình ollama cũ", allow_fail=True)
+run_cmd(["pkill", "-f", "ollama serve"], "Kill ollama cũ", allow_fail=True)
 
-# ---- Start Ollama ----
-_hdr("Start Ollama serve (user mode)")
+# ---- Start Ollama với cấu hình MINIMAL ----
+_hdr("Start Ollama (MINIMAL CONFIG)")
 OLLAMA_LOG.write_text("")
 ollama_env = os.environ.copy()
 ollama_env["OLLAMA_HOST"] = f"127.0.0.1:{OLLAMA_PORT}"
 ollama_env["OLLAMA_MODELS"] = str(DATA_DIR / "models")
-ollama_env["OLLAMA_KEEP_ALIVE"] = "24h"
-ollama_env["OLLAMA_NUM_PARALLEL"] = str(MAX_ACTIVE_USERS)
+ollama_env["OLLAMA_KEEP_ALIVE"] = "10m"  # Giảm từ 24h
+ollama_env["OLLAMA_NUM_PARALLEL"] = "1"  # CHỈ 1 request đồng thời
 ollama_env["OLLAMA_MAX_LOADED_MODELS"] = "1"
+# Giới hạn RAM cho Ollama
+ollama_env["OLLAMA_MAX_VRAM"] = "256m"  # Chỉ dùng 256MB
 
 subprocess.Popen(
     [str(OLLAMA_EXEC), "serve"],
@@ -295,8 +270,7 @@ subprocess.Popen(
     stderr=subprocess.STDOUT,
     env=ollama_env
 )
-print(f"Ollama đang khởi động trên cổng {OLLAMA_PORT}... (log: {OLLAMA_LOG})")
-print(f"Waiting for Ollama to be fully ready (this may take 30-60s)...")
+print(f"Ollama đang khởi động trên cổng {OLLAMA_PORT}...")
 
 import aiohttp
 
@@ -312,15 +286,12 @@ def wait_for_ollama(timeout=180):
                 consecutive_success += 1
                 print(f"[Ollama] Response OK ({consecutive_success}/3)")
                 if consecutive_success >= 3:
-                    print(f"✓ Ollama fully ready on port {OLLAMA_PORT}")
-                    time.sleep(2)  # Extra buffer
+                    print(f"✓ Ollama ready on port {OLLAMA_PORT}")
+                    time.sleep(2)
                     return True
             else:
                 consecutive_success = 0
-        except requests.exceptions.ConnectionError:
-            consecutive_success = 0
-        except Exception as e:
-            print(f"[Ollama] Check error: {e}")
+        except:
             consecutive_success = 0
         time.sleep(3)
     return False
@@ -331,9 +302,9 @@ if not wait_for_ollama():
 
 print("✓ Ollama service is ready!")
 
-# ---- Pull model ----
+# ---- Pull model (với retry) ----
 _hdr(f"Pull model {MODEL}")
-max_pull_attempts = 3
+max_pull_attempts = 2  # Giảm số lần thử
 for attempt in range(max_pull_attempts):
     try:
         print(f"[Pull] Attempt {attempt + 1}/{max_pull_attempts}...")
@@ -344,16 +315,13 @@ for attempt in range(max_pull_attempts):
         else:
             print(f"✗ Pull failed with exit code {result}")
             if attempt < max_pull_attempts - 1:
-                print(f"Waiting 5s before retry...")
                 time.sleep(5)
     except Exception as e:
         print(f"✗ Pull error: {e}")
         if attempt < max_pull_attempts - 1:
-            print(f"Waiting 5s before retry...")
             time.sleep(5)
         else:
-            print(f"WARNING: Failed to pull model after {max_pull_attempts} attempts")
-            print(f"Bot will start but model may not be available until manually pulled")
+            print(f"WARNING: Model pull failed")
             STATUS["last_err"] = f"Model pull failed: {e}"
 
 # ---- Warm-up ----
@@ -366,16 +334,13 @@ def _warm(label, prompt):
             "stream": False,
             "keep_alive": 300,
             "options": {
-                "num_thread": (os.cpu_count() or 2),
-                "num_ctx": 1536,
-                "num_predict": 64
+                "num_thread": 2,  # Giảm threads
+                "num_ctx": 512,   # Giảm context
+                "num_predict": 32  # Giảm predict
             }
         }
         r = requests.post(f"http://127.0.0.1:{OLLAMA_PORT}/api/chat", json=body, timeout=120)
-        try:
-            txt = r.json().get("message", {}).get("content", "")
-        except:
-            txt = r.text[:120]
+        txt = r.json().get("message", {}).get("content", "") if r.ok else r.text[:120]
         print(f"{label}:", r.status_code, txt[:160])
         STATUS["phase"] = "ready"
     except Exception as e:
@@ -384,7 +349,7 @@ def _warm(label, prompt):
 
 _warm("Warm-up(chat)", WARMUP_PROMPT)
 
-# ---- Helper functions (Brain, History, KB, RAG...) ----
+# ---- Helper functions ----
 def load_json(path, default):
     try:
         return json.loads(Path(path).read_text())
@@ -395,7 +360,7 @@ def save_json(path, data):
     Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2))
 
 def brain_path(uid): return BRAIN_DIR / f"{uid}.json"
-def brain_get(uid):  return load_json(brain_path(uid), {"notes": []})
+def brain_get(uid): return load_json(brain_path(uid), {"notes": []})
 def brain_add(uid, text):
     d = brain_get(uid)
     d["notes"].append({"ts": int(time.time()), "text": text})
@@ -403,19 +368,19 @@ def brain_add(uid, text):
 
 def brain_all_text(uid):
     notes = [n["text"] for n in brain_get(uid).get("notes", [])]
-    s = "\n".join(f"- {t}" for t in notes) if notes else "(chưa có ghi nhớ)"
+    s = "\n".join(f"- {t}" for t in notes[-3:]) if notes else "(chưa có)"  # Chỉ lấy 3 notes mới nhất
     if BRAIN_MAX_CHARS > 0 and len(s) > BRAIN_MAX_CHARS:
         s = s[:BRAIN_MAX_CHARS] + "…"
     return s
 
 def hist_path(cid): return HIST_DIR / f"{cid}.json"
-def hist_get(cid):  return load_json(hist_path(cid), {"messages": []})
+def hist_get(cid): return load_json(hist_path(cid), {"messages": []})
 def hist_set(cid, msgs): save_json(hist_path(cid), {"messages": msgs})
 
 def conf_get(): return load_json(CONF_FILE, {"auto_channels": [], "auto_train": True})
 def conf_set(cfg): save_json(CONF_FILE, cfg)
 
-# KB functions
+# KB functions (SIMPLIFIED - không dùng scikit-learn)
 def kb_append(item: dict):
     with open(KB_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(item, ensure_ascii=False) + "\n")
@@ -434,7 +399,7 @@ def kb_all():
             pass
     return out
 
-def kb_recent(n=10):
+def kb_recent(n=5):  # Giảm từ 10
     lines = KB_FILE.read_text(encoding="utf-8").splitlines() if KB_FILE.exists() else []
     items = []
     for ln in lines[-n:]:
@@ -452,77 +417,60 @@ def kb_compose_text(it):
         return f"Q: {it.get('q','').strip()}\nA: {it.get('a','').strip()}"
     return it.get("text", "").strip()
 
-def kb_inject_for_query(query: str, top_k=RAG_TOPK, max_chars=RAG_CHARS):
+# RAG đơn giản - không dùng TF-IDF
+def kb_inject_for_query(query: str, top_k=1, max_chars=200):
     items = kb_all()
     if not items:
         return None
-    texts = [kb_compose_text(it) for it in items]
-    idxs = []
-    try:
-        from sklearn.feature_extraction.text import TfidfVectorizer
-        from sklearn.metrics.pairwise import cosine_similarity
-        vec = TfidfVectorizer(max_features=30000, ngram_range=(1, 2))
-        X = vec.fit_transform(texts + [query])
-        sims = cosine_similarity(X[-1], X[:-1]).ravel()
-        idxs = sims.argsort()[::-1][:top_k].tolist()
-    except Exception:
-        qset = set(query.lower().split())
-        scored = []
-        for i, t in enumerate(texts):
-            sset = set(t.lower().split())
-            score = len(qset & sset) / (len(qset) + 1e-6)
-            scored.append((score, i))
-        idxs = [i for (s, i) in sorted(scored, reverse=True)[:top_k] if s > 0]
-    if not idxs:
+    
+    # Simple keyword matching
+    qset = set(query.lower().split())
+    scored = []
+    for i, it in enumerate(items):
+        text = kb_compose_text(it)
+        tset = set(text.lower().split())
+        score = len(qset & tset) / (len(qset) + 1e-6)
+        if score > 0:
+            scored.append((score, i, text))
+    
+    if not scored:
         return None
+    
+    scored.sort(reverse=True)
     lines = []
-    for i in idxs:
-        if i is None or i >= len(texts):
-            continue
-        snip = texts[i].strip()
-        if max_chars and len(snip) > max_chars:
-            snip = snip[:max_chars] + "…"
+    for score, i, text in scored[:top_k]:
+        snip = text.strip()[:max_chars]
         lines.append(f"- {snip}")
-    return "Kiến thức liên quan:\n" + "\n".join(lines) if lines else None
+    
+    return "Kiến thức:\n" + "\n".join(lines) if lines else None
 
 def kb_inject_for_prompt(prompt: str):
     return kb_inject_for_query(prompt, top_k=RAG_TOPK, max_chars=RAG_CHARS)
 
-# ---- Vision helpers ----
-IMG_MAX_BYTES = 1_500_000
-IMG_MAX_ATTACH = 3
+# ---- Vision helpers (BỎ ảnh để tiết kiệm RAM) ----
+IMG_MAX_BYTES = 500_000  # Giảm từ 1.5MB
+IMG_MAX_ATTACH = 1  # CHỈ 1 ảnh
 
 # ================= WEB SERVER (Flask) =================
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    """Health check endpoint cho UptimeRobot"""
     uptime = int(time.time() - START_TIME)
     return jsonify({
         "status": "ok",
-        "service": "Discord AI Bot by victory_vn",
-        "model": STATUS.get("model", MODEL),
+        "service": "Discord AI Bot (512MB optimized)",
+        "model": MODEL,
         "phase": STATUS.get("phase", "ready"),
         "uptime_seconds": uptime,
-        "uptime_human": human_timedelta(uptime),
-        "active_users": len(ACTIVE_USERS),
-        "max_users": MAX_ACTIVE_USERS,
-        "avg_response_time": f"{STATUS.get('avg_sec', 0.0):.2f}s",
-        "kb_size": len(kb_all()),
-        "ports": {
-            "web": WEB_PORT,
-            "ollama": OLLAMA_PORT
-        },
-        "url": f"http://0.0.0.0:{WEB_PORT}",
-        "endpoints": ["/", "/health", "/stats", "/ping"]
+        "ram_limit": "512MB",
+        "ports": {"web": WEB_PORT, "ollama": OLLAMA_PORT}
     })
 
 @app.route('/health')
 def health():
-    """Endpoint health check chi tiết"""
     try:
         r = requests.get(f"http://127.0.0.1:{OLLAMA_PORT}/api/tags", timeout=5)
         ollama_ok = r.ok
@@ -532,37 +480,24 @@ def health():
     return jsonify({
         "bot_ready": bot.is_ready() if 'bot' in globals() else False,
         "ollama_ready": ollama_ok,
-        "status": STATUS,
-        "ports": {
-            "web": WEB_PORT,
-            "ollama": OLLAMA_PORT
-        }
+        "status": STATUS
     })
 
 @app.route('/stats')
 def stats():
-    """Statistics endpoint"""
     return jsonify({
-        "model": STATUS.get("model", MODEL),
-        "phase": STATUS.get("phase", "ready"),
+        "model": MODEL,
+        "phase": STATUS.get("phase"),
         "avg_sec": STATUS.get("avg_sec", 0.0),
         "total_requests": STATUS.get("count", 0),
-        "active_slots": f"{len(ACTIVE_USERS)}/{MAX_ACTIVE_USERS}",
-        "kb_entries": len(kb_all()),
-        "last_error": STATUS.get("last_err", ""),
-        "ports": {
-            "web": WEB_PORT,
-            "ollama": OLLAMA_PORT
-        }
+        "active_slots": f"{len(ACTIVE_USERS)}/{MAX_ACTIVE_USERS}"
     })
 
 @app.route('/ping')
 def ping():
-    """Simple ping endpoint"""
     return "pong", 200
 
 def run_flask():
-    """Chạy Flask server trong thread riêng"""
     try:
         print(f"[Flask] Starting on 0.0.0.0:{WEB_PORT}...")
         app.run(host='0.0.0.0', port=WEB_PORT, debug=False, use_reloader=False)
@@ -573,11 +508,10 @@ def run_flask():
 # ================= Discord bot =================
 import discord
 from discord.ext import commands
-from discord import app_commands
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix=commands.when_mentioned_or("!"), intents=intents, help_command=None)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 allowed_mentions = discord.AllowedMentions(everyone=False, users=True, roles=False, replied_user=True)
 
 session: aiohttp.ClientSession | None = None
@@ -585,27 +519,23 @@ START_TIME = time.time()
 SEMA = asyncio.Semaphore(MAX_ACTIVE_USERS)
 ACTIVE_USERS = set()
 NOTIFIED = {}
-AUTO_TRAIN_ENABLED = True
 
-DEFAULT_SYSTEM = (
-    "Bạn là trợ lý AI nói tiếng Việt, lịch sự, súc tích. "
-    "Luôn trả lời ngắn gọn, rõ ràng, chỉ 1 tin nhắn (≤ ~1900 ký tự). "
-    "Nếu không chắc, hãy nói 'Mình không chắc' và gợi ý cách kiểm chứng."
-)
+DEFAULT_SYSTEM = "Bạn là trợ lý AI, trả lời ngắn gọn bằng tiếng Việt (≤1900 ký tự)."
 
+# PROFILES tối ưu cho 512MB
 ADAPTIVE_PROFILES = [
-    {"name": "L1-fast", "num_ctx": 3072, "num_predict": 256, "num_batch": 64},
-    {"name": "L2-safe", "num_ctx": 2048, "num_predict": 224, "num_batch": 48},
-    {"name": "L3-ultra", "num_ctx": 1536, "num_predict": 192, "num_batch": 32},
+    {"name": "L3-ultra", "num_ctx": 512, "num_predict": 128, "num_batch": 16},  # Ultra minimal
+    {"name": "L2-safe", "num_ctx": 768, "num_predict": 192, "num_batch": 24},
+    {"name": "L1-fast", "num_ctx": 1024, "num_predict": 256, "num_batch": 32},
 ]
 
 def _base_opts(profile):
     return {
-        "num_thread": (os.cpu_count() or 2),
-        "temperature": 0.25,
+        "num_thread": 2,  # Fixed 2 threads
+        "temperature": 0.3,
         "top_p": 0.9,
-        "top_k": 40,
-        "repeat_penalty": 1.15,
+        "top_k": 30,
+        "repeat_penalty": 1.1,
         "num_ctx": profile["num_ctx"],
         "num_predict": profile["num_predict"],
         "num_batch": profile["num_batch"]
@@ -621,18 +551,18 @@ def clip_one_msg(t):
 
 def build_messages_with_brain(uid, msgs, extra_system=None):
     brain_txt = brain_all_text(uid)
-    sys = DEFAULT_SYSTEM + f"\nGhi nhớ về người dùng:\n{brain_txt}\n"
+    sys = DEFAULT_SYSTEM
+    if brain_txt != "(chưa có)":
+        sys += f"\nGhi nhớ: {brain_txt}"
     if extra_system:
         sys += "\n" + extra_system.strip()
     return [{"role": "system", "content": sys}] + msgs
 
 def human_timedelta(seconds: float):
     seconds = int(seconds)
-    d, seconds = divmod(seconds, 86400)
     h, seconds = divmod(seconds, 3600)
     m, s = divmod(seconds, 60)
     parts = []
-    if d: parts.append(f"{d}d")
     if h: parts.append(f"{h}h")
     if m: parts.append(f"{m}m")
     parts.append(f"{s}s")
@@ -642,84 +572,29 @@ async def extract_images_from_message(msg: discord.Message):
     imgs = []
     for a in msg.attachments[:IMG_MAX_ATTACH]:
         ctype = (a.content_type or "").lower()
-        fname = a.filename or ""
-        if (ctype.startswith("image/") or fname.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))):
+        if ctype.startswith("image/"):
             try:
                 b = await a.read()
                 if len(b) > IMG_MAX_BYTES:
                     b = b[:IMG_MAX_BYTES]
                 imgs.append(base64.b64encode(b).decode("utf-8"))
-            except Exception as e:
-                STATUS["last_err"] = f"read_image_error: {e}"
+            except:
                 continue
     return imgs
 
-async def _chat_once(messages, model, opts, stream=True):
+async def _chat_once(messages, model, opts, stream=False):  # BẮT BUỘC stream=False để tiết kiệm RAM
     await ensure_session()
     url = f"http://127.0.0.1:{OLLAMA_PORT}/api/chat"
     body = {"model": model, "messages": messages, "stream": stream, "keep_alive": 300, "options": opts}
-    if stream:
-        async with session.post(url, json=body) as resp:
-            acc = ""
-            async for raw in resp.content:
-                line = raw.decode("utf-8", "ignore").strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except:
-                    continue
-                msg = data.get("message", {})
-                if "content" in msg:
-                    acc += msg["content"]
-                if data.get("done"):
-                    break
-            if resp.status >= 400 and not acc:
-                raise RuntimeError(f"CHAT HTTP {resp.status}")
-            return acc or "(rỗng)"
-    else:
-        async with session.post(url, json=body) as resp:
-            txt = await resp.text()
-            if resp.status >= 400:
-                raise RuntimeError(f"CHAT HTTP {resp.status}: {txt[:300]}")
-            try:
-                return json.loads(txt).get("message", {}).get("content", "") or "(rỗng)"
-            except:
-                return "(rỗng)"
-
-async def _generate_fallback(messages, model, opts):
-    await ensure_session()
-    url = f"http://127.0.0.1:{OLLAMA_PORT}/api/generate"
-    sys_txt = ""
-    seq = []
-    for m in messages:
-        r = m.get("role")
-        c = m.get("content", "").strip()
-        if r == "system":
-            sys_txt = c
-        elif r == "user":
-            seq.append(f"User: {c}")
-        elif r == "assistant":
-            seq.append(f"Assistant: {c}")
-    full_prompt = ((f"System: {sys_txt}\n") if sys_txt else "") + "\n".join(seq) + "\nAssistant:"
-    body = {"model": model, "prompt": full_prompt, "stream": False, "keep_alive": 300, "options": opts}
+    
     async with session.post(url, json=body) as resp:
         txt = await resp.text()
         if resp.status >= 400:
-            raise RuntimeError(f"GEN HTTP {resp.status}: {txt[:300]}")
+            raise RuntimeError(f"CHAT HTTP {resp.status}")
         try:
-            return json.loads(txt).get("response", "") or "(rỗng)"
+            return json.loads(txt).get("message", {}).get("content", "") or "(rỗng)"
         except:
-            out = ""
-            for line in txt.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    out += json.loads(line).get("response", "")
-                except:
-                    pass
-            return out or "(rỗng)"
+            return "(rỗng)"
 
 async def ollama_chat(messages, model: str):
     last_error = None
@@ -727,13 +602,10 @@ async def ollama_chat(messages, model: str):
     for prof in profiles:
         opts = _base_opts(prof)
         try:
-            return await _chat_once(messages, model, opts, stream=True)
-        except Exception:
-            try:
-                return await _generate_fallback(messages, model, opts)
-            except Exception as e2:
-                last_error = e2
-                continue
+            return await _chat_once(messages, model, opts, stream=False)
+        except Exception as e:
+            last_error = e
+            continue
     raise RuntimeError(f"{type(last_error).__name__}: {last_error}")
 
 async def can_start_or_notify(author, channel) -> bool:
@@ -741,13 +613,12 @@ async def can_start_or_notify(author, channel) -> bool:
     if author.id in ACTIVE_USERS:
         if now - NOTIFIED.get(("self", author.id), 0) >= 10:
             NOTIFIED[("self", author.id)] = now
-            await channel.send(f"{author.mention} Đang xử lý tin trước, đợi xíu nhé. ❤️", allowed_mentions=allowed_mentions)
+            await channel.send(f"{author.mention} Đang xử lý tin trước, đợi xíu nhé.", allowed_mentions=allowed_mentions)
         return False
     if len(ACTIVE_USERS) >= MAX_ACTIVE_USERS:
-        eta = max(8, int(STATUS.get("avg_sec", 15))) if STATUS.get("avg_sec", 0) > 0 else 20
         if now - NOTIFIED.get(("full", author.id), 0) >= 30:
             NOTIFIED[("full", author.id)] = now
-            await channel.send(f"{author.mention} Mình đang bận tối đa {MAX_ACTIVE_USERS} người, ước ~{eta}s nữa nhé. ❤️", allowed_mentions=allowed_mentions)
+            await channel.send(f"{author.mention} Đang bận, đợi ~20s nhé.", allowed_mentions=allowed_mentions)
         return False
     ACTIVE_USERS.add(author.id)
     return True
@@ -785,23 +656,20 @@ async def ai_flow(channel, author, prompt: str, *, extra_system=None, mention_us
             reply = await ollama_chat(merged, MODEL)
     except Exception as e:
         STATUS["last_err"] = str(e)
-        traceback.print_exc()
-        reply = f"Lỗi LOCAL API: {type(e).__name__}: {e}"
+        reply = f"Lỗi: {type(e).__name__}"
     finally:
         msgs.append({"role": "assistant", "content": reply})
         hist_set(channel.id, msgs[-HISTORY_TURNS * 2:])
         release_user(author.id)
 
     try:
-        if True:
-            kb_append({
-                "type": "qa",
-                "q": prompt,
-                "a": reply,
-                "author_id": author.id,
-                "channel_id": getattr(channel, 'id', None),
-                "ts": int(time.time())
-            })
+        kb_append({
+            "type": "qa",
+            "q": prompt,
+            "a": reply,
+            "author_id": author.id,
+            "ts": int(time.time())
+        })
     except:
         pass
 
@@ -817,31 +685,6 @@ async def ai_flow(channel, author, prompt: str, *, extra_system=None, mention_us
         target = mention_user or author
         await channel.send(f"{target.mention} {clip_one_msg(reply)}", allowed_mentions=allowed_mentions)
 
-# Bot-to-bot logic
-B2B_SESSION = {}
-
-def b2b_start_for_initiator(cid, pid):
-    B2B_SESSION[cid] = {"partner_id": pid, "allow_reply": False, "expires": time.time() + 60}
-
-def b2b_allow_once_for_responder(cid, pid):
-    B2B_SESSION[cid] = {"partner_id": pid, "allow_reply": True, "expires": time.time() + 30}
-
-def b2b_can_reply(cid, aid):
-    s = B2B_SESSION.get(cid)
-    if not s:
-        return False
-    if time.time() > s["expires"]:
-        B2B_SESSION.pop(cid, None)
-        return False
-    return s["allow_reply"] and s["partner_id"] == aid
-
-def b2b_after_reply(cid):
-    s = B2B_SESSION.get(cid)
-    if not s:
-        return
-    s["allow_reply"] = False
-    s["expires"] = time.time() + 5
-
 # ===== Events =====
 @bot.event
 async def on_ready():
@@ -850,14 +693,13 @@ async def on_ready():
         if not getattr(bot, "_synced", False):
             await bot.tree.sync()
             bot._synced = True
-    except Exception as e:
-        print("Sync slash lỗi:", e)
+    except:
+        pass
     print(f"Bot online: {bot.user} (ID: {bot.user.id})")
     print(f"Web server: http://0.0.0.0:{WEB_PORT}")
-    print(f"UptimeRobot URL: http://YOUR_RENDER_URL:{WEB_PORT}/")
     try:
         await bot.change_presence(
-            activity=discord.Game(name=f"Web: 0.0.0.0:{WEB_PORT} | Nhắn @{BOT_NICKNAME}"),
+            activity=discord.Game(name=f"RAM: 512MB | Model: {MODEL}"),
             status=discord.Status.online
         )
     except:
@@ -873,19 +715,6 @@ async def on_ready():
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
-        if bot.user in message.mentions:
-            ch_id = message.channel.id
-            author_id = message.author.id
-            if ch_id not in B2B_SESSION:
-                b2b_allow_once_for_responder(ch_id, author_id)
-            if b2b_can_reply(ch_id, author_id):
-                try:
-                    await message.channel.send(
-                        f"{message.author.mention} Xin chào người dùng! Tôi có thể giúp gì cho bạn hôm nay?",
-                        allowed_mentions=allowed_mentions
-                    )
-                finally:
-                    b2b_after_reply(ch_id)
         return
 
     content = message.content.strip()
@@ -912,7 +741,7 @@ async def on_message(message: discord.Message):
             imgs = await extract_images_from_message(message)
             await ai_flow(message.channel, message.author, clean, images=imgs)
         else:
-            await message.reply("Bạn cần nhập nội dung sau khi mention mình nha.", allowed_mentions=allowed_mentions)
+            await message.reply("Bạn cần nhập nội dung sau khi mention.", allowed_mentions=allowed_mentions)
         return
 
     await bot.process_commands(message)
@@ -924,71 +753,49 @@ async def ai_cmd(ctx, *, prompt: str):
     await ai_flow(ctx.channel, ctx.author, prompt, images=imgs)
 
 @bot.command(name="describe")
-async def describe_cmd(ctx, *, hint: str = "Mô tả chi tiết nội dung ảnh."):
+async def describe_cmd(ctx, *, hint: str = "Mô tả ảnh."):
     imgs = await extract_images_from_message(ctx.message)
     if not imgs:
-        await ctx.reply("Vui lòng đính kèm ít nhất 1 ảnh.", allowed_mentions=allowed_mentions)
+        await ctx.reply("Vui lòng đính kèm ảnh.", allowed_mentions=allowed_mentions)
         return
     await ai_flow(ctx.channel, ctx.author, hint, images=imgs)
-
-@bot.command(name="chatai")
-async def chatai_cmd(ctx):
-    if not ctx.message.mentions:
-        await ctx.reply(f"{ctx.author.mention} Dùng: !chatai @user", allowed_mentions=allowed_mentions)
-        return
-    target = ctx.message.mentions[0]
-    can = await can_start_or_notify(ctx.author, ctx.channel)
-    if not can:
-        return
-    try:
-        async with SEMA:
-            b2b_start_for_initiator(ctx.channel.id, target.id)
-            await ctx.channel.send(
-                f"{target.mention} Chào bạn! Tôi có thể giúp gì cho bạn hôm nay?",
-                allowed_mentions=allowed_mentions
-            )
-    finally:
-        release_user(ctx.author.id)
 
 @bot.command(name="train")
 async def train_cmd(ctx, sub: str = "status", *, payload: str = ""):
     ssub = sub.lower() if sub else "status"
     if ssub in ("status", "stat"):
         await ctx.reply(
-            f"{ctx.author.mention} Auto-train: ON | KB: {len(kb_all())} mục.",
+            f"{ctx.author.mention} KB: {len(kb_all())} mục.",
             allowed_mentions=allowed_mentions
         )
     elif ssub in ("list", "ls"):
-        n = 10
-        if payload.strip().isdigit():
-            n = max(1, min(100, int(payload.strip())))
-        items = kb_recent(n)
+        items = kb_recent(5)
         if not items:
             await ctx.reply(f"{ctx.author.mention} KB trống.", allowed_mentions=allowed_mentions)
             return
         lines = []
         for it in items:
             if it.get("type") == "qa":
-                s = f"QA: Q={it.get('q','')[:70]} | A={it.get('a','')[:70]}"
+                s = f"Q={it.get('q','')[:50]}"
             else:
-                s = f"DOC: {it.get('text','')[:140]}"
+                s = f"{it.get('text','')[:100]}"
             lines.append(s)
         await ctx.reply(
-            clip_one_msg("KB gần đây:\n" + "\n".join(f"- {l}" for l in lines)),
+            clip_one_msg("KB:\n" + "\n".join(f"- {l}" for l in lines)),
             allowed_mentions=allowed_mentions
         )
     elif ssub == "clear":
         if not (ctx.author.guild_permissions.manage_messages if ctx.guild else False):
             await ctx.reply(
-                f"{ctx.author.mention} Cần quyền Manage Messages để xóa KB.",
+                f"{ctx.author.mention} Cần quyền Manage Messages.",
                 allowed_mentions=allowed_mentions
             )
             return
         kb_clear()
-        await ctx.reply(f"{ctx.author.mention} Đã xóa toàn bộ KB.", allowed_mentions=allowed_mentions)
+        await ctx.reply(f"{ctx.author.mention} Đã xóa KB.", allowed_mentions=allowed_mentions)
     else:
         await ctx.reply(
-            f"{ctx.author.mention} Dùng: !train status | !train list [n] | !train clear",
+            f"{ctx.author.mention} Dùng: !train status | !train list | !train clear",
             allowed_mentions=allowed_mentions
         )
 
@@ -998,7 +805,7 @@ async def auto_cmd(ctx, mode: str = None):
     s = set(cfg.get("auto_channels", []))
     if mode is None:
         await ctx.reply(
-            f"{ctx.author.mention} Auto ở kênh này đang: {'ON' if ctx.channel.id in s else 'OFF'}",
+            f"{ctx.author.mention} Auto: {'ON' if ctx.channel.id in s else 'OFF'}",
             allowed_mentions=allowed_mentions
         )
         return
@@ -1016,24 +823,19 @@ async def auto_cmd(ctx, mode: str = None):
         return
     cfg["auto_channels"] = list(s)
     conf_set(cfg)
-    await ctx.reply(f"{ctx.author.mention} Auto {msg} cho kênh này.", allowed_mentions=allowed_mentions)
+    await ctx.reply(f"{ctx.author.mention} Auto {msg}.", allowed_mentions=allowed_mentions)
 
 @bot.command(name="remember")
 async def remember_cmd(ctx, *, text: str):
     brain_add(ctx.author.id, text.strip())
-    await ctx.reply(f"{ctx.author.mention} Đã lưu vào brain của bạn.", allowed_mentions=allowed_mentions)
+    await ctx.reply(f"{ctx.author.mention} Đã lưu.", allowed_mentions=allowed_mentions)
 
 @bot.command(name="brain")
 async def brain_cmd(ctx, action: str = "show", who: str = ""):
     target = ctx.author
-    if who:
-        if ctx.message.mentions:
-            target = ctx.message.mentions[0]
-        else:
-            try:
-                target = await bot.fetch_user(int(who))
-            except:
-                pass
+    if who and ctx.message.mentions:
+        target = ctx.message.mentions[0]
+    
     if action == "show":
         await ctx.reply(
             f"{ctx.author.mention} Brain của {target.mention}:\n{clip_one_msg(brain_all_text(target.id))}",
@@ -1042,12 +844,12 @@ async def brain_cmd(ctx, action: str = "show", who: str = ""):
     elif action == "clear":
         save_json(brain_path(target.id), {"notes": []})
         await ctx.reply(
-            f"{ctx.author.mention} Đã xóa brain của {target.mention}.",
+            f"{ctx.author.mention} Đã xóa brain.",
             allowed_mentions=allowed_mentions
         )
     else:
         await ctx.reply(
-            f"{ctx.author.mention} Dùng: !brain show [@user] | !brain clear [@user]",
+            f"{ctx.author.mention} Dùng: !brain show | !brain clear",
             allowed_mentions=allowed_mentions
         )
 
@@ -1055,7 +857,7 @@ async def brain_cmd(ctx, action: str = "show", who: str = ""):
 async def clear_cmd(ctx):
     hist_set(ctx.channel.id, [])
     await ctx.reply(
-        f"{ctx.author.mention} Đã xóa lịch sử hội thoại kênh này.",
+        f"{ctx.author.mention} Đã xóa lịch sử.",
         allowed_mentions=allowed_mentions
     )
 
@@ -1065,77 +867,41 @@ async def model_cmd(ctx, *, m: str = ""):
     if m:
         MODEL = m.strip()
         STATUS["model"] = MODEL
-        await ctx.reply(f"{ctx.author.mention} Đã set model: {MODEL}", allowed_mentions=allowed_mentions)
+        await ctx.reply(f"{ctx.author.mention} Model: {MODEL}", allowed_mentions=allowed_mentions)
     else:
-        await ctx.reply(f"{ctx.author.mention} Model hiện tại: {MODEL}", allowed_mentions=allowed_mentions)
+        await ctx.reply(f"{ctx.author.mention} Model: {MODEL}", allowed_mentions=allowed_mentions)
 
 @bot.command(name="info")
 async def info_cmd(ctx):
     ws = int(bot.latency * 1000)
     up = int(time.time() - START_TIME)
     await ctx.reply(
-        f"{ctx.author.mention}\nCreator: victory_vn\nModel: {MODEL}\n"
-        f"Uptime: {human_timedelta(up)}\nWS Ping: {ws} ms\n"
-        f"Web Server: http://0.0.0.0:{WEB_PORT}\n"
-        f"Ollama: http://127.0.0.1:{OLLAMA_PORT}",
+        f"{ctx.author.mention}\nModel: {MODEL}\n"
+        f"Uptime: {human_timedelta(up)}\nWS Ping: {ws}ms\n"
+        f"RAM Limit: 512MB\nWeb: http://0.0.0.0:{WEB_PORT}",
         allowed_mentions=allowed_mentions
     )
 
-def _read_free():
-    try:
-        out = subprocess.check_output(["free", "-m"], text=True).strip().split('\n')
-        mem_line = out[1].split()
-        total, used, free = mem_line[1], mem_line[2], mem_line[3]
-        return f"{used}/{total}MB (free {free}MB)"
-    except:
-        return "n/a"
-
-def _loadavg():
-    try:
-        la = os.getloadavg()
-        return f"{la[0]:.2f} {la[1]:.2f} {la[2]:.2f}"
-    except:
-        return "n/a"
-
 @bot.command(name="status")
 async def status_cmd(ctx):
-    ph = STATUS.get("phase", "")
-    mdl = STATUS.get("model", "")
-    pct = STATUS.get("pull_pct", 0)
-    lyr = STATUS.get("pull_layer", "")
-    done, tot = STATUS.get("pull_bytes", (0, 0))
+    ph = STATUS.get("phase", "ready")
+    mdl = STATUS.get("model", MODEL)
     avg = STATUS.get("avg_sec", 0.0)
     err = STATUS.get("last_err", "")
 
-    def _mb(n):
-        try:
-            return f"{n/1048576:.1f}MB"
-        except:
-            return "0MB"
-
-    if ph == "pulling":
-        msg = f"Phase: pulling\nModel: {mdl}\nTiến độ: {pct}% | Layer: {lyr} ({_mb(done)}/{_mb(tot)})"
-    elif ph == "warmup":
-        msg = f"Phase: warmup\nModel: {mdl}"
-    elif ph == "answering":
-        eta = max(8, int(avg)) if avg > 0 else 15
-        msg = f"Phase: answering… (ETA ~{eta}s)"
-    else:
-        msg = f"Phase: {ph or 'ready'}\nModel: {mdl}\nAvg time: ~{avg:.1f}s"
+    msg = f"Phase: {ph}\nModel: {mdl}\nAvg: ~{avg:.1f}s"
     if err:
-        msg += f"\nLast error: {err[:160]}"
+        msg += f"\nError: {err[:100]}"
     await ctx.reply(msg, allowed_mentions=allowed_mentions)
 
 @bot.command(name="stats")
 async def stats_cmd(ctx):
-    eta = max(8, int(STATUS.get("avg_sec", 15))) if STATUS.get("avg_sec", 0) > 0 else 15
     slots = f"{len(ACTIVE_USERS)}/{MAX_ACTIVE_USERS}"
     msg = (
-        f"Model: {STATUS.get('model', MODEL)}\nPhase: {STATUS.get('phase','ready')}\n"
-        f"Avg time: ~{STATUS.get('avg_sec',0.0):.1f}s | ETA lúc bận: ~{eta}s\n"
-        f"Slots: {slots}\nRAM: {_read_free()} | Load: {_loadavg()}\n"
-        f"Profile: {PREFERRED_PROFILE}\nWeb: http://0.0.0.0:{WEB_PORT}\n"
-        f"Ollama: http://127.0.0.1:{OLLAMA_PORT}"
+        f"Model: {MODEL}\nPhase: {STATUS.get('phase','ready')}\n"
+        f"Avg: ~{STATUS.get('avg_sec',0.0):.1f}s\n"
+        f"Slots: {slots}\nRAM: 512MB limit\n"
+        f"Web: http://0.0.0.0:{WEB_PORT}"
     )
     await ctx.reply(msg, allowed_mentions=allowed_mentions)
 
@@ -1145,46 +911,31 @@ async def pull_cmd(ctx, *, model: str):
     STATUS["phase"] = "pulling"
     STATUS["model"] = model
     msg = await ctx.reply(f"{ctx.author.mention} Pull {model}: 0%", allowed_mentions=allowed_mentions)
-    layers = {}
-    last_pct = -1
-    last_edit = 0
+    
     try:
         async with session.post(
             f"http://127.0.0.1:{OLLAMA_PORT}/api/pull",
             json={"name": model, "stream": True}
         ) as resp:
+            last_pct = -1
             async for raw in resp.content:
                 line = raw.decode("utf-8", "ignore").strip()
                 if not line:
                     continue
                 try:
                     data = json.loads(line)
+                    comp = int(data.get("completed") or 0)
+                    tot = int(data.get("total") or 1)
+                    pct = int(comp * 100 / tot) if tot else 0
+                    
+                    if pct != last_pct and pct % 10 == 0:
+                        last_pct = pct
+                        await msg.edit(content=f"{ctx.author.mention} Pull: {pct}%")
                 except:
                     continue
-                if "error" in data:
-                    STATUS["last_err"] = data["error"]
-                    raise RuntimeError(data["error"])
-                status = data.get("status", "")
-                comp = int(data.get("completed") or 0)
-                tot = int(data.get("total") or 0)
-                dig = (data.get("digest") or "layer").replace("sha256:", "")[:12]
-                if tot > 0:
-                    layers[dig] = (comp, tot)
-                total = sum(t for _, t in layers.values()) or tot
-                done = sum(c for c, _ in layers.values()) or comp
-                pct = int(done * 100 / total) if total else 0
-                STATUS["pull_pct"] = pct
-                STATUS["pull_layer"] = dig
-                STATUS["pull_bytes"] = (done, total)
-                now = time.time()
-                if pct != last_pct or now - last_edit > 1.0:
-                    last_pct = pct
-                    last_edit = now
-                    await msg.edit(
-                        content=f"{ctx.author.mention} Pull {model}: {pct}% - {dig} ({done/1048576:.1f}MB/{tot/1048576:.1f}MB)"
-                    )
+        
         STATUS["phase"] = "ready"
-        await msg.edit(content=f"{ctx.author.mention} Pull {model}: 100% ✅")
+        await msg.edit(content=f"{ctx.author.mention} Pull done ✅")
     except Exception as e:
         STATUS["last_err"] = str(e)
         await msg.edit(content=f"{ctx.author.mention} Pull lỗi: {e}")
@@ -1195,70 +946,36 @@ async def warm_cmd(ctx):
         STATUS["phase"] = "warmup"
         body = {
             "model": MODEL,
-            "messages": [{"role": "user", "content": WARMUP_PROMPT}],
+            "messages": [{"role": "user", "content": "hi"}],
             "stream": False,
-            "keep_alive": 300,
-            "options": {"num_thread": (os.cpu_count() or 2), "num_ctx": 1536, "num_predict": 64}
+            "options": {"num_thread": 2, "num_ctx": 512, "num_predict": 32}
         }
-        r = requests.post(f"http://127.0.0.1:{OLLAMA_PORT}/api/chat", json=body, timeout=180)
+        r = requests.post(f"http://127.0.0.1:{OLLAMA_PORT}/api/chat", json=body, timeout=120)
         STATUS["phase"] = "ready"
-        await ctx.reply(f"{ctx.author.mention} Warm status: {r.status_code}", allowed_mentions=allowed_mentions)
+        await ctx.reply(f"{ctx.author.mention} Warm: {r.status_code}", allowed_mentions=allowed_mentions)
     except Exception as e:
-        STATUS["last_err"] = str(e)
         await ctx.reply(f"{ctx.author.mention} Warm lỗi: {e}", allowed_mentions=allowed_mentions)
 
 @bot.command(name="health")
 async def health_cmd(ctx):
     try:
         r = requests.get(f"http://127.0.0.1:{OLLAMA_PORT}/api/tags", timeout=5)
-        await ctx.reply(f"{ctx.author.mention} /api/tags: {r.status_code}", allowed_mentions=allowed_mentions)
+        await ctx.reply(f"{ctx.author.mention} Health: {r.status_code}", allowed_mentions=allowed_mentions)
     except Exception as e:
         await ctx.reply(f"{ctx.author.mention} Health lỗi: {e}", allowed_mentions=allowed_mentions)
-
-@bot.command(name="log")
-async def log_tail_cmd(ctx, n: int = 120):
-    n = max(20, min(400, n))
-    if not OLLAMA_LOG.exists():
-        await ctx.reply(f"{ctx.author.mention} Chưa có log.", allowed_mentions=allowed_mentions)
-        return
-    tail = "".join(OLLAMA_LOG.read_text(errors="ignore").splitlines(True)[-n:])
-    await ctx.reply(f"```{tail[-(DISCORD_MAX-10):]}```", allowed_mentions=allowed_mentions)
-
-@bot.command(name="saveall")
-async def saveall_cmd(ctx):
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for root, _, files in os.walk(DATA_DIR):
-            for fn in files:
-                p = Path(root) / fn
-                arc = str(p.relative_to(DATA_DIR.parent))
-                z.write(p, arcname=arc)
-        if OLLAMA_LOG.exists():
-            z.write(OLLAMA_LOG, arcname="logs/ollama.log")
-    buf.seek(0)
-    try:
-        await ctx.reply(file=discord.File(buf, filename="bot_backup.zip"))
-    except Exception as e:
-        await ctx.reply(f"{ctx.author.mention} Không gửi được file: {e}", allowed_mentions=allowed_mentions)
 
 @bot.command(name="help")
 async def help_cmd(ctx):
     text = (
-        "**Lệnh Bot**\n"
-        "- Chat: @mention bot | !ai <nội dung> | DM bot (có thể kèm ảnh)\n"
-        "- !describe (kèm ảnh): mô tả ảnh nhanh\n"
-        "- !train status | !train list [n] | !train clear\n"
-        "- !auto on|off | !remember <text> | !brain show|clear\n"
-        "- !chatai @user: bot-to-bot 1 vòng\n"
-        "- !status, !stats, !info, !health\n"
-        "- !model [id] | !pull <model> | !warm\n"
-        "- !clear | !log [n] | !saveall | !web\n\n"
-        f"**Web Endpoints** (Port {WEB_PORT}):\n"
-        "- GET / → health check JSON (cho UptimeRobot)\n"
-        "- GET /health → chi tiết health\n"
-        "- GET /stats → statistics\n"
-        "- GET /ping → simple ping\n\n"
-        f"Model: {MODEL} | Slots: {MAX_ACTIVE_USERS}\n"
+        "**Commands**\n"
+        "- @mention bot | !ai <text> | DM bot\n"
+        "- !describe (kèm ảnh)\n"
+        "- !train status/list/clear\n"
+        "- !auto on/off | !remember <text>\n"
+        "- !brain show/clear | !clear\n"
+        "- !status | !stats | !info | !health\n"
+        "- !model [id] | !pull <model> | !warm\n\n"
+        f"Model: {MODEL} | RAM: 512MB\n"
         f"Web: http://0.0.0.0:{WEB_PORT}"
     )
     try:
@@ -1269,60 +986,32 @@ async def help_cmd(ctx):
     except:
         await ctx.reply(text, allowed_mentions=allowed_mentions)
 
-@bot.command(name="web")
-async def web_cmd(ctx):
-    """Hiển thị thông tin web server"""
-    await ctx.reply(
-        f"{ctx.author.mention}\n"
-        f"**Web Server Info:**\n"
-        f"- Local: http://0.0.0.0:{WEB_PORT}\n"
-        f"- Ollama: http://127.0.0.1:{OLLAMA_PORT}\n\n"
-        f"**Endpoints:**\n"
-        f"- GET / (health check)\n"
-        f"- GET /health (chi tiết)\n"
-        f"- GET /stats (thống kê)\n"
-        f"- GET /ping (test)\n\n"
-        f"**UptimeRobot Setup:**\n"
-        f"1. Lấy URL từ Render dashboard\n"
-        f"2. Thêm vào UptimeRobot: https://YOUR_RENDER_URL/\n"
-        f"3. Interval: 5 phút\n"
-        f"4. Monitor Type: HTTP(s)",
-        allowed_mentions=allowed_mentions
-    )
-
-# ======== Main: Chạy Flask + Discord bot ========
+# ======== Main ========
 async def main():
-    """Khởi động cả Flask và Discord bot"""
-    # Start Flask trong thread riêng
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    print(f"✓ Flask web server started on port {WEB_PORT}")
-    print(f"✓ UptimeRobot endpoint: http://0.0.0.0:{WEB_PORT}/")
+    print(f"✓ Flask started on port {WEB_PORT}")
     
-    # Lấy token từ environment variable
     TOKEN = os.environ.get("DISCORD_TOKEN")
     if not TOKEN:
-        raise RuntimeError("DISCORD_TOKEN environment variable not set!")
+        raise RuntimeError("DISCORD_TOKEN not set!")
     
-    print("Đang khởi động Discord bot...")
-    print(f"Web server: http://0.0.0.0:{WEB_PORT}")
-    print(f"Ollama API: http://127.0.0.1:{OLLAMA_PORT}")
+    print("Starting Discord bot...")
+    print(f"Web: http://0.0.0.0:{WEB_PORT}")
+    print(f"Ollama: http://127.0.0.1:{OLLAMA_PORT}")
     await bot.start(TOKEN)
 
-# Entry point
 if __name__ == "__main__":
     try:
-        # Kiểm tra token từ env trước
         TOKEN = os.environ.get("DISCORD_TOKEN")
         if not TOKEN:
-            print("ERROR: DISCORD_TOKEN environment variable not set!")
-            print("Please set it in Render dashboard or use: export DISCORD_TOKEN='your_token'")
+            print("ERROR: DISCORD_TOKEN not set!")
             sys.exit(1)
         
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n✓ Bot đã dừng")
+        print("\n✓ Bot stopped")
     except Exception as e:
-        print(f"Fatal error: {e}")
+        print(f"Fatal: {e}")
         traceback.print_exc()
         sys.exit(1)
