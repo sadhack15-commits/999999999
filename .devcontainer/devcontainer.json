@@ -1,0 +1,9 @@
+{
+  "name": "High-Spec Codespace",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "hostRequirements": {
+    "cpus": 12,
+    "memory": "12gb",
+    "storage": "120gb"
+  }
+}
