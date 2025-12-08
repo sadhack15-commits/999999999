@@ -1,24 +1,11 @@
 {
-  "name": "High-Spec Codespace",
-  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
-  "hostRequirements": {
-    "cpus": 12,
-    "memory": "12gb",
-    "storage": "120gb"
-  },
-  "forwardPorts": [3000, 8000, 8080, 5000, 9000],
-  "portsAttributes": {
-    "3000": {
-      "label": "App",
-      "onAutoForward": "notify"
-    },
-    "8000": {
-      "label": "Web Server",
-      "onAutoForward": "openBrowser"
-    },
-    "8080": {
-      "label": "HTTP",
-      "onAutoForward": "notify"
+  "name": "Ubuntu 24.04 with Docker",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "version": "latest",
+      "dockerDashComposeVersion": "v2"
     }
-  }
+  },
+  "postCreateCommand": "docker --version"
 }
